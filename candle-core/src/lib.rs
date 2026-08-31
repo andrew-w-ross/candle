@@ -51,6 +51,7 @@
 mod accelerate;
 pub mod backend;
 pub mod backprop;
+pub mod bnb_nf4;
 pub mod conv;
 mod convert;
 pub mod cpu;
