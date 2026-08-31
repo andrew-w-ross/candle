@@ -1,6 +1,10 @@
-//! 1D and 2D Convolutions
+//! 1D, 2D and 3D Convolutions
 //!
 use crate::{op::BackpropOp, op::Op, Error, Result, Tensor};
+
+fn conv_out_dim(i: usize, k: usize, padding: usize, stride: usize, dilation: usize) -> usize {
+    (i + 2 * padding - dilation * (k - 1) - 1) / stride + 1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv1D {
@@ -125,6 +129,68 @@ impl ParamsConvTranspose2D {
 
     pub(crate) fn out_dims(&self) -> Vec<usize> {
         vec![self.b_size, self.c_out, self.out_h(), self.out_w()]
+    }
+}
+
+/// Parameters for a 3D convolution, following the PyTorch `nn.Conv3d` semantics. Spatial
+/// parameters are ordered `[depth, height, width]`, matching the trailing dimensions of an
+/// `(N, C, D, H, W)` input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamsConv3D {
+    pub(crate) b_size: usize,
+    pub(crate) i_d: usize,
+    pub(crate) i_h: usize,
+    pub(crate) i_w: usize,
+    pub(crate) k_d: usize,
+    pub(crate) k_h: usize,
+    pub(crate) k_w: usize,
+    pub(crate) c_out: usize,
+    pub(crate) c_in: usize,
+    pub(crate) padding: [usize; 3],
+    pub(crate) stride: [usize; 3],
+    pub(crate) dilation: [usize; 3],
+    pub cudnn_fwd_algo: Option<CudnnFwdAlgo>,
+}
+
+impl ParamsConv3D {
+    pub(crate) fn out_d(&self) -> usize {
+        conv_out_dim(
+            self.i_d,
+            self.k_d,
+            self.padding[0],
+            self.stride[0],
+            self.dilation[0],
+        )
+    }
+
+    pub(crate) fn out_h(&self) -> usize {
+        conv_out_dim(
+            self.i_h,
+            self.k_h,
+            self.padding[1],
+            self.stride[1],
+            self.dilation[1],
+        )
+    }
+
+    pub(crate) fn out_w(&self) -> usize {
+        conv_out_dim(
+            self.i_w,
+            self.k_w,
+            self.padding[2],
+            self.stride[2],
+            self.dilation[2],
+        )
+    }
+
+    pub(crate) fn out_dims(&self) -> Vec<usize> {
+        vec![
+            self.b_size,
+            self.c_out,
+            self.out_d(),
+            self.out_h(),
+            self.out_w(),
+        ]
     }
 }
 
@@ -335,6 +401,108 @@ impl Tensor {
                 .iter()
                 .zip(&kernel)
                 .map(|(block, kernel)| block.conv2d_single_group(kernel, &params))
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::cat(&blocks, 1)
+        }
+    }
+
+    fn conv3d_single_group(&self, kernel: &Self, params: &ParamsConv3D) -> Result<Self> {
+        let storage =
+            self.storage()
+                .conv3d(self.layout(), &kernel.storage(), kernel.layout(), params)?;
+        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::Conv3D {
+            arg,
+            kernel,
+            padding: params.padding,
+            stride: params.stride,
+            dilation: params.dilation,
+        });
+        let out_dims = params.out_dims();
+        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+    }
+
+    /// Applies a 3D convolution over the input tensor.
+    ///
+    /// The input is expected to have shape `(b_size, c_in, i_d, i_h, i_w)` and the kernel
+    /// `(c_out, c_in / groups, k_d, k_h, k_w)`. `padding`, `stride` and `dilation` are given
+    /// per spatial axis as `[depth, height, width]`.
+    pub fn conv3d(
+        &self,
+        kernel: &Self,
+        padding: [usize; 3],
+        stride: [usize; 3],
+        dilation: [usize; 3],
+        groups: usize,
+    ) -> Result<Self> {
+        self.conv3d_with_algo(kernel, padding, stride, dilation, groups, None)
+    }
+
+    /// Same as [`Self::conv3d`] but allows forcing a specific cuDNN forward algorithm.
+    pub fn conv3d_with_algo(
+        &self,
+        kernel: &Self,
+        padding: [usize; 3],
+        stride: [usize; 3],
+        dilation: [usize; 3],
+        groups: usize,
+        cudnn_fwd_algo: Option<CudnnFwdAlgo>,
+    ) -> Result<Self> {
+        let (b_size, c_in, i_d, i_h, i_w) = self.dims5()?;
+        let (c_out, c_in_k, k_d, k_h, k_w) = kernel.dims5()?;
+        if groups == 0 {
+            crate::bail!("conv3d: groups must be strictly positive")
+        }
+        if c_in != c_in_k * groups {
+            crate::bail!(
+                "in_channel mismatch between input ({c_in}, groups {groups}) and kernel ({c_in_k})"
+            )
+        }
+        if c_out % groups != 0 {
+            crate::bail!("out_channel {c_out} is not divisible by the number of groups {groups}")
+        }
+        if stride.contains(&0) {
+            crate::bail!("conv3d: stride must be strictly positive, got {stride:?}")
+        }
+        if dilation.contains(&0) {
+            crate::bail!("conv3d: dilation must be strictly positive, got {dilation:?}")
+        }
+        for (idx, ((i, k), (p, d))) in [i_d, i_h, i_w]
+            .into_iter()
+            .zip([k_d, k_h, k_w])
+            .zip(padding.into_iter().zip(dilation))
+            .enumerate()
+        {
+            if i + 2 * p < d * (k - 1) + 1 {
+                crate::bail!(
+                    "conv3d: input size {i} with padding {p} is too small for kernel size {k} \
+                     with dilation {d} on spatial axis {idx}"
+                )
+            }
+        }
+        let params = ParamsConv3D {
+            b_size,
+            i_d,
+            i_h,
+            i_w,
+            k_d,
+            k_h,
+            k_w,
+            c_out: c_out / groups,
+            c_in: c_in / groups,
+            padding,
+            stride,
+            dilation,
+            cudnn_fwd_algo,
+        };
+        if groups == 1 {
+            self.conv3d_single_group(kernel, &params)
+        } else {
+            let blocks = self.chunk(groups, 1)?;
+            let kernel = kernel.chunk(groups, 0)?;
+            let blocks = blocks
+                .iter()
+                .zip(&kernel)
+                .map(|(block, kernel)| block.conv3d_single_group(kernel, &params))
                 .collect::<Result<Vec<_>>>()?;
             Tensor::cat(&blocks, 1)
         }

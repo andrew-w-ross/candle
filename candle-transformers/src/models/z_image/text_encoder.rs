@@ -399,6 +399,68 @@ impl ZImageTextEncoder {
         })
     }
 
+    /// Create causal attention mask
+    fn causal_mask(&self, b: usize, tgt: usize, offset: usize) -> Result<Tensor> {
+        let minf = f32::NEG_INFINITY;
+        let mask: Vec<_> = (0..tgt)
+            .flat_map(|i| {
+                (0..(tgt + offset)).map(move |j| if j <= i + offset { 0.0 } else { minf })
+            })
+            .collect();
+        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Attention mask combining causality with right padding: a key past
+    /// `valid` is masked for every query, which is what padding a prompt to a
+    /// fixed length means. Broadcast over the batch.
+    fn attention_mask(&self, len: usize, valid: usize) -> Result<Tensor> {
+        let minf = f32::NEG_INFINITY;
+        let mask: Vec<_> = (0..len)
+            .flat_map(|i| (0..len).map(move |j| if j <= i && j < valid { 0.0 } else { minf }))
+            .collect();
+        Tensor::from_slice(&mask, (1, 1, len, len), &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Hidden states at the given indices, numbered the way transformers numbers
+    /// `output_hidden_states`: `0` is the embedding output and `n` the output of
+    /// layer `n - 1`. `layers` must be ascending. `valid` is the number of
+    /// leading non-padding tokens.
+    ///
+    /// Loading fewer layers than the checkpoint has is supported and expected:
+    /// nothing past the largest requested index is ever read.
+    pub fn forward_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        valid: usize,
+        layers: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (_, len) = input_ids.dims2()?;
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let mask = if len == 1 {
+            None
+        } else {
+            Some(self.attention_mask(len, valid)?)
+        };
+
+        let mut out = Vec::with_capacity(layers.len());
+        if layers.first() == Some(&0) {
+            out.push(hidden_states.clone());
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            if out.len() == layers.len() {
+                break;
+            }
+            hidden_states = layer.forward(&hidden_states, mask.as_ref(), 0)?;
+            if layers.get(out.len()) == Some(&(index + 1)) {
+                out.push(hidden_states.clone());
+            }
+        }
+        if out.len() != layers.len() {
+            candle::bail!("requested hidden states {layers:?} beyond the loaded layers")
+        }
+        Ok(out)
+    }
+
     /// Encode text, returning second-to-last layer hidden states
     ///
     /// # Arguments
@@ -409,19 +471,13 @@ impl ZImageTextEncoder {
     ///
     /// **Important**: Returns raw output from layer[-2] WITHOUT final RMSNorm
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let (_b, l) = input_ids.dims2()?;
+        let (b, l) = input_ids.dims2()?;
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         let causal = if l == 1 {
             None
         } else {
-            Some(crate::utils::build_additive_causal_mask(
-                l,
-                0,
-                None,
-                &self.device,
-                self.dtype,
-            )?)
+            Some(self.causal_mask(b, l, 0)?)
         };
 
         // num_hidden_layers = 36, second-to-last layer index = 34

@@ -3,6 +3,18 @@
 //! This layer applies Group Normalization over a mini-batch of inputs.
 use candle::{DType, Result, Tensor};
 
+/// Set `CANDLE_DISABLE_FUSED_GROUP_NORM=1` to fall back to the unfused path.
+fn fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CANDLE_DISABLE_FUSED_GROUP_NORM").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
 // This group norm version handles both weight and bias so removes the mean.
 #[derive(Clone, Debug)]
 pub struct GroupNorm {
@@ -51,6 +63,20 @@ impl crate::Module for GroupNorm {
             )
         }
         let x_dtype = x.dtype();
+        if fused_enabled()
+            && x.device().is_cuda()
+            && matches!(x_dtype, DType::F16 | DType::BF16)
+            && self.weight.dtype() == x_dtype
+            && self.bias.dtype() == x_dtype
+        {
+            return crate::ops::group_norm(
+                x,
+                &self.weight,
+                &self.bias,
+                self.num_groups,
+                self.eps as f32,
+            );
+        }
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
             d => d,

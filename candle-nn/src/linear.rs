@@ -37,43 +37,50 @@ impl Linear {
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
     }
+
+    /// `x @ weight.t() + bias`, with the bias fused into the gemm epilogue when
+    /// the backend can do that.
+    fn matmul_bias(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(bias) = &self.bias {
+            if let Some(ys) = crate::ops::try_linear_bias(x, &self.weight, bias)? {
+                return Ok(ys);
+            }
+        }
+        let ys = x.matmul(&self.weight.t()?)?;
+        match &self.bias {
+            None => Ok(ys),
+            Some(bias) => ys.broadcast_add(bias),
+        }
+    }
+
+    fn add_bias(&self, ys: Tensor) -> Result<Tensor> {
+        match &self.bias {
+            None => Ok(ys),
+            Some(bias) => ys.broadcast_add(bias),
+        }
+    }
 }
 
 impl super::Module for Linear {
     fn forward(&self, x: &Tensor) -> candle::Result<Tensor> {
         // When possible, we avoid using a broadcasted matmul as it is much slower
         // than the standard matmul for the cuda and cpu backends.
-        let x = match *x.dims() {
-            [b1, b2, m, k] => {
-                if x.is_contiguous() {
-                    let w = self.weight.t()?;
-                    x.reshape((b1 * b2 * m, k))?
-                        .matmul(&w)?
-                        .reshape((b1, b2, m, ()))?
-                } else {
-                    let w = self.weight.broadcast_left((b1, b2))?.t()?;
-                    x.matmul(&w)?
-                }
+        match *x.dims() {
+            [b1, b2, m, k] if x.is_contiguous() => self
+                .matmul_bias(&x.reshape((b1 * b2 * m, k))?)?
+                .reshape((b1, b2, m, ())),
+            [b1, b2, _, _] => {
+                let w = self.weight.broadcast_left((b1, b2))?.t()?;
+                self.add_bias(x.matmul(&w)?)
             }
-            [bsize, m, k] => {
-                if x.is_contiguous() {
-                    let w = self.weight.t()?;
-                    x.reshape((bsize * m, k))?
-                        .matmul(&w)?
-                        .reshape((bsize, m, ()))?
-                } else {
-                    let w = self.weight.broadcast_left(bsize)?.t()?;
-                    x.matmul(&w)?
-                }
+            [bsize, m, k] if x.is_contiguous() => self
+                .matmul_bias(&x.reshape((bsize * m, k))?)?
+                .reshape((bsize, m, ())),
+            [bsize, _, _] => {
+                let w = self.weight.broadcast_left(bsize)?.t()?;
+                self.add_bias(x.matmul(&w)?)
             }
-            _ => {
-                let w = self.weight.t()?;
-                x.matmul(&w)?
-            }
-        };
-        match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
+            _ => self.matmul_bias(x),
         }
     }
 }

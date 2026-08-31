@@ -65,6 +65,14 @@ pub trait BackendStorage: Sized {
         _params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self>;
 
+    fn conv3d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self>;
+
     fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self>;
     fn max_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self>;
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self>;

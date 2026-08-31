@@ -183,6 +183,111 @@ __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
     }
 }
 
+// GroupNorm, fused. Two passes over the row (mean, then the biased mean of
+// squared deviations) so the variance never goes through E[x^2] - E[x]^2, and
+// every accumulator is f32 regardless of the storage type. One row is one
+// (batch, group) pair of `ncols = channels_per_group * spatial` elements; the
+// affine parameters are per channel, so they change every `spatial` elements.
+#define GROUPNORM_BLOCK 1024
+
+static __device__ __forceinline__ float
+block_reduce_sum_f32(float x, float *warp_sums, float *bcast) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+    __syncthreads();
+    x = warp_reduce_sum(x);
+    if (lane == 0) {
+        warp_sums[warp] = x;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < n_warps ? warp_sums[lane] : 0.f;
+        v = warp_reduce_sum(v);
+        if (lane == 0) {
+            *bcast = v;
+        }
+    }
+    __syncthreads();
+    return *bcast;
+}
+
+template <typename T>
+__device__ void groupnorm(const T *x, T *dst, const T *alpha, const T *beta,
+                          const int ncols, const int spatial,
+                          const int spatial_log2, const int channels_per_group,
+                          const int num_groups, const float eps) {
+    __shared__ float warp_sums[WARP_SIZE];
+    __shared__ float bcast;
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const T *xr = x + (size_t)row * (size_t)ncols;
+    T *dr = dst + (size_t)row * (size_t)ncols;
+
+    float sum = 0.f;
+#pragma unroll 4
+    for (int col = tid; col < ncols; col += GROUPNORM_BLOCK) {
+        sum += static_cast<float>(xr[col]);
+    }
+    const float mean = block_reduce_sum_f32(sum, warp_sums, &bcast) / (float)ncols;
+
+    float m2 = 0.f;
+#pragma unroll 4
+    for (int col = tid; col < ncols; col += GROUPNORM_BLOCK) {
+        const float d = static_cast<float>(xr[col]) - mean;
+        m2 += d * d;
+    }
+    const float var = block_reduce_sum_f32(m2, warp_sums, &bcast) / (float)ncols;
+    const float inv_std = rsqrtf(var + eps);
+
+    const int ch_base = (row % num_groups) * channels_per_group;
+    if (spatial_log2 >= 0) {
+#pragma unroll 4
+        for (int col = tid; col < ncols; col += GROUPNORM_BLOCK) {
+            const int c = ch_base + (col >> spatial_log2);
+            const float a = static_cast<float>(alpha[c]);
+            const float b = static_cast<float>(beta[c]);
+            dr[col] = static_cast<T>((static_cast<float>(xr[col]) - mean) * inv_std * a + b);
+        }
+    } else {
+#pragma unroll 4
+        for (int col = tid; col < ncols; col += GROUPNORM_BLOCK) {
+            const int c = ch_base + col / spatial;
+            const float a = static_cast<float>(alpha[c]);
+            const float b = static_cast<float>(beta[c]);
+            dr[col] = static_cast<T>((static_cast<float>(xr[col]) - mean) * inv_std * a + b);
+        }
+    }
+}
+
+// GeGLU, fused. A row of `2 * ncols` inputs becomes a row of `ncols` outputs:
+// the first half is the value, the second half the gate. The gelu is candle's
+// tanh approximation, evaluated at least as wide as the storage type, so the
+// store is the only rounding.
+template <typename T> struct geglu_acc { typedef float type; };
+template <> struct geglu_acc<double> { typedef double type; };
+
+static __device__ __forceinline__ float geglu_tanh(float x) { return tanhf(x); }
+static __device__ __forceinline__ double geglu_tanh(double x) { return tanh(x); }
+
+template <typename T>
+__device__ void geglu(const T *x, T *dst, const size_t nrows, const size_t ncols) {
+    typedef typename geglu_acc<T>::type A;
+    const size_t numel = nrows * ncols;
+    const size_t stride = (size_t)blockDim.x * (size_t)gridDim.x;
+    for (size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < numel;
+         i += stride) {
+        const size_t base = (i / ncols) * ncols + i;
+        const A v = static_cast<A>(x[base]);
+        const A g = static_cast<A>(x[base + ncols]);
+        const A inner = static_cast<A>(0.7978845608028654) *
+                        (g + static_cast<A>(0.044715) * g * g * g);
+        dst[i] = static_cast<T>(
+            v * (static_cast<A>(0.5) * g * (static_cast<A>(1) + geglu_tanh(inner))));
+    }
+}
+
 // RmsNorm implementation adapted from ggml, accumulation is made using f32.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L523
 template <typename T>
@@ -612,6 +717,22 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     layernorm<TYPENAME>(src, dst, alpha, beta, n_cols, block_size, eps);       \
   }                                                                            \
 
+#define GROUPNORM_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void __launch_bounds__(GROUPNORM_BLOCK) FN_NAME(       \
+      const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
+      const TYPENAME *beta, const int n_cols, const int spatial,               \
+      const int spatial_log2, const int channels_per_group,                    \
+      const int num_groups, const float eps) {                                 \
+    groupnorm<TYPENAME>(src, dst, alpha, beta, n_cols, spatial, spatial_log2,  \
+                        channels_per_group, num_groups, eps);                  \
+  }                                                                            \
+
+#define GEGLU_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(const TYPENAME *src, TYPENAME *dst,       \
+                                     const size_t nrows, const size_t ncols) { \
+    geglu<TYPENAME>(src, dst, nrows, ncols);                                   \
+  }                                                                            \
+
 #define ROPE_OP(TYPENAME, FN_NAME, FN_NAME_I, FN_NAME_THD) \
   extern "C" __global__ void FN_NAME_I( \
       const TYPENAME *src, \
@@ -651,6 +772,8 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
+GROUPNORM_OP(__nv_bfloat16, groupnorm_bf16)
+GEGLU_OP(__nv_bfloat16, geglu_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(__nv_bfloat16, sum_bf16)
 FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argmax_bf16, fast_sum_bf16)
@@ -668,6 +791,8 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argm
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
+GROUPNORM_OP(__half, groupnorm_f16)
+GEGLU_OP(__half, geglu_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
 FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
@@ -681,7 +806,11 @@ SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
+GROUPNORM_OP(float, groupnorm_f32)
+GEGLU_OP(float, geglu_f32)
 LAYERNORM_OP(double, layernorm_f64)
+GROUPNORM_OP(double, groupnorm_f64)
+GEGLU_OP(double, geglu_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)
 ROPE_OP(double, rope_f64, rope_i_f64, rope_thd_f64)
 

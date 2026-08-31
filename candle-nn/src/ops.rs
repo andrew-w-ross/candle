@@ -944,6 +944,591 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
     xs.apply_op3_no_bwd(alpha, beta, &LayerNorm { eps })
 }
 
+#[derive(Debug, Clone)]
+struct GroupNorm {
+    eps: f32,
+    num_groups: usize,
+}
+
+struct GroupNormDims {
+    n_rows: usize,
+    n_cols: usize,
+    spatial: usize,
+    channels_per_group: usize,
+}
+
+impl GroupNorm {
+    fn dims(&self, layout: &Layout) -> Result<GroupNormDims> {
+        let dims = layout.shape().dims();
+        if dims.len() < 3 {
+            candle::bail!("input rank for GroupNorm should be at least 3, got {dims:?}")
+        }
+        let (b_sz, n_channels) = (dims[0], dims[1]);
+        if !n_channels.is_multiple_of(self.num_groups) {
+            candle::bail!(
+                "GroupNorm: num_groups ({}) must divide num_channels ({n_channels})",
+                self.num_groups
+            )
+        }
+        let spatial = dims[2..].iter().product::<usize>();
+        let channels_per_group = n_channels / self.num_groups;
+        Ok(GroupNormDims {
+            n_rows: b_sz * self.num_groups,
+            n_cols: channels_per_group * spatial,
+            spatial,
+            channels_per_group,
+        })
+    }
+}
+
+impl candle::CustomOp3 for GroupNorm {
+    fn name(&self) -> &'static str {
+        "group-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        let d = self.dims(l1)?;
+        let eps = self.eps;
+        #[allow(clippy::too_many_arguments)]
+        fn inner<
+            T: candle::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f32>
+                + num_traits::FromPrimitive,
+        >(
+            src: &[T],
+            layout: &Layout,
+            alpha: &[T],
+            alpha_layout: &Layout,
+            beta: &[T],
+            beta_layout: &Layout,
+            d: &GroupNormDims,
+            num_groups: usize,
+            eps: f32,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let alpha = match alpha_layout.contiguous_offsets() {
+                None => candle::bail!("alpha has to be contiguous"),
+                Some((o1, o2)) => &alpha[o1..o2],
+            };
+            let beta = match beta_layout.contiguous_offsets() {
+                None => candle::bail!("beta has to be contiguous"),
+                Some((o1, o2)) => &beta[o1..o2],
+            };
+            let dims = layout.shape().dims();
+            let mut dst = vec![T::zero(); layout.shape().elem_count()];
+            src.par_chunks(d.n_cols)
+                .zip(dst.par_chunks_mut(d.n_cols))
+                .enumerate()
+                .for_each(|(row, (src, dst))| {
+                    let n = d.n_cols as f32;
+                    let mut sum = 0f32;
+                    for v in src {
+                        sum += v.as_();
+                    }
+                    let mean = sum / n;
+                    let mut m2 = 0f32;
+                    for v in src {
+                        let dv = v.as_() - mean;
+                        m2 += dv * dv;
+                    }
+                    let inv_std = (m2 / n + eps).sqrt().recip();
+                    let ch_base = (row % num_groups) * d.channels_per_group;
+                    for (col, (dd, s)) in dst.iter_mut().zip(src.iter()).enumerate() {
+                        let c = ch_base + col / d.spatial;
+                        let a = alpha[c].as_();
+                        let b = beta[c].as_();
+                        let v = (s.as_() - mean) * inv_std * a + b;
+                        *dd = T::from_f32(v).unwrap_or_else(T::nan);
+                    }
+                });
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, Shape::from_dims(dims)))
+        }
+
+        use CpuStorage as C;
+        match (s1, s2, s3) {
+            (C::BF16(s1), C::BF16(s2), C::BF16(s3)) => {
+                inner::<half::bf16>(s1, l1, s2, l2, s3, l3, &d, self.num_groups, eps)
+            }
+            (C::F16(s1), C::F16(s2), C::F16(s3)) => {
+                inner::<half::f16>(s1, l1, s2, l2, s3, l3, &d, self.num_groups, eps)
+            }
+            (C::F32(s1), C::F32(s2), C::F32(s3)) => {
+                inner::<f32>(s1, l1, s2, l2, s3, l3, &d, self.num_groups, eps)
+            }
+            (C::F64(s1), C::F64(s2), C::F64(s3)) => {
+                inner::<f64>(s1, l1, s2, l2, s3, l3, &d, self.num_groups, eps)
+            }
+            _ => candle::bail!("unsupported dtype for group-norm {:?}", s1.dtype()),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+        s3: &candle::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
+        };
+        use candle::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
+        use candle::{CudaDevice, WithDType};
+
+        const GROUPNORM_BLOCK: u32 = 1024;
+
+        struct S {
+            eps: f32,
+            num_groups: usize,
+            d: GroupNormDims,
+        }
+        impl Map3 for S {
+            fn f<T: DeviceRepr + WithDType>(
+                &self,
+                src: &CudaSlice<T>,
+                layout: &Layout,
+                alpha: &CudaSlice<T>,
+                alpha_layout: &Layout,
+                beta: &CudaSlice<T>,
+                beta_layout: &Layout,
+                dev: &CudaDevice,
+            ) -> Result<CudaSlice<T>> {
+                let src = match layout.contiguous_offsets() {
+                    None => candle::bail!("input has to be contiguous"),
+                    Some((o1, o2)) => src.slice(o1..o2),
+                };
+                let alpha = match alpha_layout.contiguous_offsets() {
+                    None => candle::bail!("alpha has to be contiguous"),
+                    Some((o1, o2)) => alpha.slice(o1..o2),
+                };
+                let beta = match beta_layout.contiguous_offsets() {
+                    None => candle::bail!("beta has to be contiguous"),
+                    Some((o1, o2)) => beta.slice(o1..o2),
+                };
+                let el = layout.shape().elem_count();
+                let spatial_log2 = if self.d.spatial.is_power_of_two() {
+                    self.d.spatial.trailing_zeros() as i32
+                } else {
+                    -1
+                };
+                let cfg = LaunchConfig {
+                    grid_dim: (self.d.n_rows as u32, 1, 1),
+                    block_dim: (GROUPNORM_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let func =
+                    dev.get_or_load_func(&kernel_name::<T>("groupnorm"), &kernels::REDUCE)?;
+                // SAFETY: Set later by running the kernel.
+                let dst = unsafe { dev.alloc::<T>(el)? };
+                let mut builder = func.builder();
+                builder.arg(&src);
+                builder.arg(&dst);
+                builder.arg(&alpha);
+                builder.arg(&beta);
+                candle::builder_arg!(
+                    builder,
+                    self.d.n_cols as i32,
+                    self.d.spatial as i32,
+                    spatial_log2,
+                    self.d.channels_per_group as i32,
+                    self.num_groups as i32,
+                    self.eps
+                );
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(dst)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device();
+        let s = S {
+            eps: self.eps,
+            num_groups: self.num_groups,
+            d: self.dims(l1)?,
+        };
+        let slice = s.map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+}
+
+/// Fused group normalization.
+///
+/// `xs` has shape `(batch, channels, ...)`, `alpha` and `beta` are per-channel
+/// affine parameters of length `channels`. The mean and variance are taken over
+/// each group of `channels / num_groups` channels together with all the trailing
+/// dimensions, accumulated in f32 whatever the storage dtype.
+pub fn group_norm(
+    xs: &Tensor,
+    alpha: &Tensor,
+    beta: &Tensor,
+    num_groups: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    let dims = xs.dims();
+    if dims.len() < 3 {
+        candle::bail!("input rank for group-norm should be at least 3, got {dims:?}")
+    }
+    let n_channels = dims[1];
+    if alpha.dims1()? != n_channels || beta.dims1()? != n_channels {
+        candle::bail!(
+            "shape mismatch in group-norm src: {:?} alpha: {:?} beta: {:?}",
+            xs.shape(),
+            alpha.shape(),
+            beta.shape()
+        )
+    }
+    let xs = xs.contiguous()?;
+    xs.apply_op3_no_bwd(alpha, beta, &GroupNorm { eps, num_groups })
+}
+
+#[derive(Debug, Clone)]
+struct GeGlu;
+
+/// Splits the last dimension of `layout` in half, giving the row count, the
+/// output row width and the output shape.
+fn geglu_dims(layout: &Layout) -> Result<(usize, usize, Shape)> {
+    let dims = layout.shape().dims();
+    let Some((&last, rest)) = dims.split_last() else {
+        candle::bail!("geglu input must have at least one dimension")
+    };
+    if last % 2 != 0 {
+        candle::bail!("geglu: last dimension must be even, got {last}")
+    }
+    let n_cols = last / 2;
+    let mut out = rest.to_vec();
+    out.push(n_cols);
+    Ok((rest.iter().product::<usize>(), n_cols, Shape::from(out)))
+}
+
+fn geglu_f64(v: f64, gate: f64) -> f64 {
+    const SQRT_TWO_OVER_PI: f64 = 0.797_884_560_802_865_4;
+    let inner = SQRT_TWO_OVER_PI * (gate + 0.044715 * gate * gate * gate);
+    v * (0.5 * gate * (1. + inner.tanh()))
+}
+
+impl candle::CustomOp1 for GeGlu {
+    fn name(&self) -> &'static str {
+        "geglu"
+    }
+
+    fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+
+        let (n_rows, n_cols, shape) = geglu_dims(l)?;
+        fn inner<
+            T: candle::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f64>
+                + num_traits::FromPrimitive,
+        >(
+            src: &[T],
+            layout: &Layout,
+            n_rows: usize,
+            n_cols: usize,
+            shape: Shape,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let mut dst = vec![T::zero(); n_rows * n_cols];
+            src.par_chunks(2 * n_cols)
+                .zip(dst.par_chunks_mut(n_cols))
+                .for_each(|(src, dst)| {
+                    let (value, gate) = src.split_at(n_cols);
+                    for ((d, v), g) in dst.iter_mut().zip(value).zip(gate) {
+                        *d =
+                            <T as num_traits::FromPrimitive>::from_f64(geglu_f64(v.as_(), g.as_()))
+                                .unwrap_or_else(T::nan);
+                    }
+                });
+            Ok((candle::WithDType::to_cpu_storage_owned(dst), shape))
+        }
+
+        use CpuStorage as C;
+        match s {
+            C::BF16(s) => inner::<half::bf16>(s, l, n_rows, n_cols, shape),
+            C::F16(s) => inner::<half::f16>(s, l, n_rows, n_cols, shape),
+            C::F32(s) => inner::<f32>(s, l, n_rows, n_cols, shape),
+            C::F64(s) => inner::<f64>(s, l, n_rows, n_cols, shape),
+            _ => candle::bail!("unsupported dtype for geglu {:?}", s.dtype()),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s: &candle::CudaStorage,
+        l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+        };
+        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
+        use candle::{CudaDevice, WithDType};
+
+        struct S {
+            n_rows: usize,
+            n_cols: usize,
+        }
+        impl Map1 for S {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                src: &CudaSlice<T>,
+                dev: &CudaDevice,
+                layout: &Layout,
+            ) -> Result<CudaSlice<T>> {
+                let src = match layout.contiguous_offsets() {
+                    None => candle::bail!("input has to be contiguous"),
+                    Some((o1, o2)) => src.slice(o1..o2),
+                };
+                let el = self.n_rows * self.n_cols;
+                let cfg =
+                    LaunchConfig::for_num_elems(u32::try_from(el).map_err(candle::Error::wrap)?);
+                let func = dev.get_or_load_func(&kernel_name::<T>("geglu"), &kernels::REDUCE)?;
+                // SAFETY: Set later by running the kernel.
+                let dst = unsafe { dev.alloc::<T>(el)? };
+                let mut builder = func.builder();
+                builder.arg(&src);
+                builder.arg(&dst);
+                candle::builder_arg!(builder, self.n_rows, self.n_cols);
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(dst)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let (n_rows, n_cols, shape) = geglu_dims(l)?;
+        let dev = s.device();
+        let slice = S { n_rows, n_cols }.map(&s.slice, dev, l)?;
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, shape))
+    }
+}
+
+/// Set `CANDLE_DISABLE_FUSED_GEGLU=1` to fall back to the unfused path.
+fn fused_geglu_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CANDLE_DISABLE_FUSED_GEGLU").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+/// Fused GeGLU: splits the last dimension of `xs` in half and returns
+/// `value * gelu(gate)` in a single pass, with the gelu evaluated in f32
+/// whatever the storage dtype. Falls back to the chunk/gelu/mul sequence on
+/// devices or dtypes the fused kernel does not cover.
+pub fn geglu(xs: &Tensor) -> Result<Tensor> {
+    let supported = matches!(
+        xs.dtype(),
+        DType::BF16 | DType::F16 | DType::F32 | DType::F64
+    ) && (xs.device().is_cuda() || xs.device().is_cpu());
+    if fused_geglu_enabled() && supported {
+        return xs.contiguous()?.apply_op1_no_bwd(&GeGlu);
+    }
+    let chunks = xs.chunk(2, D::Minus1)?;
+    match chunks.as_slice() {
+        [value, gate] => value * gate.gelu()?,
+        _ => candle::bail!("geglu: last dimension must be even, got {:?}", xs.shape()),
+    }
+}
+
+/// `x @ w.t() + b` with the bias folded into the gemm's cublasLt epilogue, so
+/// the result never round-trips through storage to have the bias added.
+#[derive(Debug, Clone)]
+struct LinearBias;
+
+impl candle::CustomOp3 for LinearBias {
+    fn name(&self) -> &'static str {
+        "linear-bias"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("linear-bias is a cuda-only op; use matmul + broadcast_add")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+        s3: &candle::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::cuda_backend::cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
+        use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaView, DeviceRepr};
+        use candle::cuda_backend::CudaStorageSlice as S;
+
+        let (m, k) = l1.shape().dims2()?;
+        let (n, k_w) = l2.shape().dims2()?;
+        if k != k_w || l3.shape().dims1()? != n {
+            candle::bail!(
+                "linear-bias shape mismatch: x {:?} w {:?} b {:?}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+
+        // cublasLt is column major, so the row-major `(m, k) x (k, n)` product is
+        // computed as its column-major transpose, `w (n, k) x x' (k, m)`. Both
+        // operands are read in place: `x` and `w` are already the transposes
+        // cublasLt wants. The bias then lands on the length-`n` leading dimension
+        // of the result, which is exactly one row of the row-major output.
+        let cfg = MatmulConfig {
+            transa: true,
+            transb: false,
+            transc: false,
+            m: n as u64,
+            n: m as u64,
+            k: k as u64,
+            alpha: 1.0,
+            lda: k as i64,
+            ldb: k as i64,
+            beta: 0.0,
+            ldc: n as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        fn run<T: DeviceRepr>(
+            lt: &CudaBlasLT,
+            cfg: MatmulConfig,
+            x: &CudaSlice<T>,
+            l1: &Layout,
+            w: &CudaSlice<T>,
+            l2: &Layout,
+            b: &CudaSlice<T>,
+            l3: &Layout,
+            dev: &candle::CudaDevice,
+        ) -> Result<CudaSlice<T>>
+        where
+            CudaBlasLT: Matmul<T>,
+        {
+            fn view<'a, T>(s: &'a CudaSlice<T>, l: &Layout, what: &str) -> Result<CudaView<'a, T>> {
+                match l.contiguous_offsets() {
+                    None => candle::bail!("linear-bias: {what} has to be contiguous"),
+                    Some((o1, o2)) => Ok(s.slice(o1..o2)),
+                }
+            }
+            let x = view(x, l1, "x")?;
+            let w = view(w, l2, "w")?;
+            let b = view(b, l3, "bias")?;
+            // SAFETY: written by the matmul below, which covers every element.
+            let mut dst = unsafe { dev.alloc::<T>(cfg.m as usize * cfg.n as usize)? };
+            // SAFETY: ffi; the layouts above match the shapes checked by the caller.
+            unsafe { lt.matmul(cfg, &w, &x, &mut dst, Some(&b), None) }
+                .map_err(candle::Error::wrap)?;
+            Ok(dst)
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device().clone();
+        let lt = dev.cublaslt_handle()?;
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (S::F16(x), S::F16(w), S::F16(b)) => S::F16(run(&lt, cfg, x, l1, w, l2, b, l3, &dev)?),
+            (S::BF16(x), S::BF16(w), S::BF16(b)) => {
+                S::BF16(run(&lt, cfg, x, l1, w, l2, b, l3, &dev)?)
+            }
+            // f32 is left out on purpose: cudarc pins its cublasLt compute type
+            // to CUBLAS_COMPUTE_32F_FAST_TF32, which candle's gemm does not use.
+            _ => candle::bail!("unsupported dtype for linear-bias {:?}", s1.dtype()),
+        };
+        Ok((
+            candle::cuda_backend::CudaStorage { slice, device: dev },
+            Shape::from((m, n)),
+        ))
+    }
+}
+
+/// Set `CANDLE_DISABLE_FUSED_LINEAR_BIAS=1` to fall back to matmul + bias add.
+fn fused_linear_bias_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CANDLE_DISABLE_FUSED_LINEAR_BIAS").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+/// `x @ w.t() + b` for a contiguous 2-D `x`, with the bias applied inside the
+/// gemm epilogue rather than as a separate pass over the result.
+///
+/// Returns `None` when the shapes, dtype or device are outside the narrow case
+/// the cublasLt path covers, so the caller can use matmul + `broadcast_add`.
+///
+/// Only f16 and bf16 are taken. For those cublasLt accumulates in f32, which is
+/// what candle's own gemm asks for, and the bias then lands on the f32
+/// accumulator so the result rounds to storage once instead of twice — strictly
+/// more accurate. f32 is deliberately left out: cudarc's cublasLt binding pins
+/// the f32 compute type to `CUBLAS_COMPUTE_32F_FAST_TF32`, which candle only
+/// uses when reduced precision is asked for.
+pub fn try_linear_bias(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
+    let supported = fused_linear_bias_enabled()
+        && x.device().is_cuda()
+        && matches!(x.dtype(), DType::F16 | DType::BF16)
+        && w.dtype() == x.dtype()
+        && b.dtype() == x.dtype()
+        && x.rank() == 2
+        && w.rank() == 2
+        && b.rank() == 1
+        && x.is_contiguous()
+        && w.is_contiguous()
+        && b.is_contiguous()
+        && x.dims()[1] == w.dims()[1]
+        && w.dims()[0] == b.dims()[0];
+    if !supported {
+        return Ok(None);
+    }
+    x.apply_op3_no_bwd(w, b, &LinearBias).map(Some)
+}
+
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html
 pub fn pixel_shuffle(xs: &Tensor, upscale_factor: usize) -> Result<Tensor> {
     let (b_size, c, h, w) = xs.dims4()?;

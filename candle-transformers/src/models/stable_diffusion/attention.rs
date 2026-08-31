@@ -20,8 +20,7 @@ impl GeGlu {
 impl Module for GeGlu {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let hidden_states_and_gate = self.proj.forward(xs)?.chunk(2, D::Minus1)?;
-        &hidden_states_and_gate[0] * hidden_states_and_gate[1].gelu()?
+        nn::ops::geglu(&self.proj.forward(xs)?)
     }
 }
 
@@ -170,6 +169,38 @@ impl CrossAttention {
         self.reshape_batch_dim_to_heads(&hidden_states)
     }
 
+    fn effective_slice_size(&self, batch_size_attention: usize) -> Option<usize> {
+        self.slice_size
+            .filter(|slice_size| batch_size_attention >= *slice_size)
+    }
+
+    /// Flash attention straight off the projection outputs.
+    ///
+    /// `(batch, seq, heads * head_dim)` reshapes to the `(batch, seq, heads, head_dim)` layout
+    /// flash-attention wants as a pure view, so none of the head-splitting or head-merging needs
+    /// to materialise a tensor. Grouping the heads under `batch` rather than folding them into it
+    /// computes the same independent per-head attention.
+    fn flash_attention(&self, query: &Tensor, key: &Tensor, value: &Tensor) -> Result<Tensor> {
+        let _enter = self.span_attn.enter();
+        let (batch, seq_len, inner_dim) = query.dims3()?;
+        let head_dim = inner_dim / self.heads;
+        let init_dtype = query.dtype();
+        let split = |xs: &Tensor| -> Result<Tensor> {
+            let (batch, seq_len, _) = xs.dims3()?;
+            xs.to_dtype(DType::F16)?
+                .reshape((batch, seq_len, self.heads, head_dim))
+        };
+        flash_attn(
+            &split(query)?,
+            &split(key)?,
+            &split(value)?,
+            self.scale as f32,
+            false,
+        )?
+        .reshape((batch, seq_len, inner_dim))?
+        .to_dtype(init_dtype)
+    }
+
     fn attention(&self, query: &Tensor, key: &Tensor, value: &Tensor) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let xs = if self.use_flash_attn {
@@ -211,11 +242,14 @@ impl CrossAttention {
         let context = context.unwrap_or(xs).contiguous()?;
         let key = self.to_k.forward(&context)?;
         let value = self.to_v.forward(&context)?;
+        let slice_size = self.effective_slice_size(query.dim(0)? * self.heads);
+        if self.use_flash_attn && slice_size.is_none() {
+            let xs = self.flash_attention(&query, &key, &value)?;
+            return self.to_out.forward(&xs);
+        }
         let query = self.reshape_heads_to_batch_dim(&query)?;
         let key = self.reshape_heads_to_batch_dim(&key)?;
         let value = self.reshape_heads_to_batch_dim(&value)?;
-        let dim0 = query.dim(0)?;
-        let slice_size = self.slice_size.filter(|&slice_size| dim0 >= slice_size);
         let xs = match slice_size {
             None => self.attention(&query, &key, &value)?,
             Some(slice_size) => self.sliced_attention(&query, &key, &value, slice_size)?,

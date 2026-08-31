@@ -125,6 +125,16 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn conv3d(
+        &self,
+        _: &Layout,
+        _: &Self,
+        _: &Layout,
+        _: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn index_select(&self, _: &Self, _: &Layout, _: &Layout, _: usize) -> Result<Self> {
         Err(Error::NotCompiledWithMetalSupport)
     }

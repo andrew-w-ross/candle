@@ -1189,6 +1189,16 @@ impl BackendStorage for MetalStorage {
         Ok(res_t)
     }
 
+    fn conv3d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        crate::bail!("conv3d is not implemented for the metal backend")
+    }
+
     fn conv_transpose2d(
         &self,
         l: &Layout,

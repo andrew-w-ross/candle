@@ -74,9 +74,9 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn apply(self, tokenizer: &mut Tokenizer) -> Result<()> {
+    fn apply(self, tokenizer: &mut Tokenizer) {
         if let Some(norm) = self.normalizer {
-            tokenizer.with_normalizer(Some(norm)).map_err(Error::wrap)?;
+            tokenizer.with_normalizer(Some(norm));
         }
         if let Some(pt) = self.pretokenizer {
             tokenizer.with_pre_tokenizer(Some(pt));
@@ -87,7 +87,6 @@ impl Pipeline {
         if let Some(pp) = self.post_processor {
             tokenizer.with_post_processor(Some(pp));
         }
-        Ok(())
     }
 }
 
@@ -259,7 +258,7 @@ impl TokenizerFromGguf for Tokenizer {
             .and_then(gguf_value_to_u32)
             .ok();
 
-        pipeline.apply(&mut tokenizer)?;
+        pipeline.apply(&mut tokenizer);
 
         // Compose existing post-processor with a template-based one if needed
         let template_pp = template_processor(&tokens, bos_id, eos_id, add_bos, add_eos);
@@ -293,9 +292,7 @@ impl TokenizerFromGguf for Tokenizer {
                 }
             }
             if !specials.is_empty() {
-                tokenizer
-                    .add_special_tokens(specials)
-                    .map_err(Error::wrap)?;
+                tokenizer.add_special_tokens(&specials);
             }
         }
 
@@ -318,9 +315,7 @@ impl TokenizerFromGguf for Tokenizer {
                 .map(|tok| AddedToken::from(tok.clone(), true))
                 .collect();
             if !specials.is_empty() {
-                tokenizer
-                    .add_special_tokens(specials)
-                    .map_err(Error::wrap)?;
+                tokenizer.add_special_tokens(&specials);
             }
         }
 

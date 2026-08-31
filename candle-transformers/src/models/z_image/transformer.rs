@@ -462,115 +462,136 @@ impl ZImageAttention {
         scale: f64,
         device: &Device,
     ) -> Result<Tensor> {
-        // If acceleration disabled, use basic implementation
-        if !self.use_accelerated_attn {
-            return self.attention_basic(q, k, v, mask, scale);
-        }
+        attention_dispatch(
+            q,
+            k,
+            v,
+            mask,
+            scale,
+            self.n_heads,
+            self.use_accelerated_attn,
+            device,
+        )
+    }
+}
 
-        // Platform dispatch: prefer optimal implementation per platform
-        if device.is_cuda() {
-            self.attention_cuda(q, k, v, mask, scale)
-        } else if device.is_metal() {
-            self.attention_metal(q, k, v, mask, scale)
-        } else {
-            // CPU fallback
-            self.attention_basic(q, k, v, mask, scale)
-        }
+/// Cross-platform attention dispatch, shared with the quantized model.
+///
+/// `q`, `k` and `v` are `(B, n_heads, seq_len, head_dim)`; `mask` is a
+/// `(B, seq_len)` key mask where 1 is valid and 0 is padding.
+pub fn attention_dispatch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+    n_heads: usize,
+    use_accelerated_attn: bool,
+    device: &Device,
+) -> Result<Tensor> {
+    if !use_accelerated_attn {
+        return attention_basic(q, k, v, mask, scale);
     }
 
-    /// CUDA: Use Flash Attention
-    #[allow(unused_variables)]
-    fn attention_cuda(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-        scale: f64,
-    ) -> Result<Tensor> {
-        #[cfg(feature = "flash-attn")]
-        {
-            // flash_attn does not directly support custom mask
-            // Fallback to basic implementation when mask is present
-            if mask.is_some() {
-                return self.attention_basic(q, k, v, mask, scale);
-            }
+    if device.is_cuda() {
+        attention_cuda(q, k, v, mask, scale)
+    } else if device.is_metal() {
+        attention_metal(q, k, v, mask, scale, n_heads)
+    } else {
+        attention_basic(q, k, v, mask, scale)
+    }
+}
 
-            // flash_attn input format: (batch, seq_len, num_heads, head_size)
-            // Current format: (batch, num_heads, seq_len, head_size)
-            let q = q.transpose(1, 2)?;
-            let k = k.transpose(1, 2)?;
-            let v = v.transpose(1, 2)?;
-
-            let result = flash_attn(&q, &k, &v, scale as f32, false)?;
-            result.transpose(1, 2)
+/// CUDA: Use Flash Attention
+#[allow(unused_variables)]
+fn attention_cuda(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    #[cfg(feature = "flash-attn")]
+    {
+        // flash_attn does not directly support custom mask
+        // Fallback to basic implementation when mask is present
+        if mask.is_some() {
+            return attention_basic(q, k, v, mask, scale);
         }
 
-        #[cfg(not(feature = "flash-attn"))]
-        {
-            // flash-attn not compiled, fallback to basic
-            self.attention_basic(q, k, v, mask, scale)
-        }
+        // flash_attn input format: (batch, seq_len, num_heads, head_size)
+        // Current format: (batch, num_heads, seq_len, head_size)
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+
+        let result = flash_attn(&q, &k, &v, scale as f32, false)?;
+        result.transpose(1, 2)
     }
 
-    /// Metal: Use fused SDPA kernel
-    fn attention_metal(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-        scale: f64,
-    ) -> Result<Tensor> {
-        // Prepare SDPA format mask
-        let sdpa_mask = self.prepare_sdpa_mask(mask, q)?;
+    #[cfg(not(feature = "flash-attn"))]
+    {
+        // flash-attn not compiled, fallback to basic
+        attention_basic(q, k, v, mask, scale)
+    }
+}
 
-        // candle_nn::ops::sdpa
-        // Input format: (bs, qhead, seq, hidden) - matches current format
-        // Supports: BF16/F16/F32, head_dim=128
-        candle_nn::ops::sdpa(q, k, v, sdpa_mask.as_ref(), false, scale as f32, 1.0)
+/// Metal: Use fused SDPA kernel
+fn attention_metal(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+    n_heads: usize,
+) -> Result<Tensor> {
+    // Prepare SDPA format mask
+    let sdpa_mask = prepare_sdpa_mask(mask, q, n_heads)?;
+
+    // candle_nn::ops::sdpa
+    // Input format: (bs, qhead, seq, hidden) - matches current format
+    // Supports: BF16/F16/F32, head_dim=128
+    candle_nn::ops::sdpa(q, k, v, sdpa_mask.as_ref(), false, scale as f32, 1.0)
+}
+
+/// Fallback implementation
+fn attention_basic(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+
+    if let Some(m) = mask {
+        // mask: (B, seq_len) -> (B, 1, 1, seq_len)
+        let m = m.unsqueeze(1)?.unsqueeze(2)?;
+        let m = m.to_dtype(attn_weights.dtype())?;
+        // 1=valid, 0=padding -> 0=valid, -inf=padding
+        let m = ((m - 1.0)? * 1e9)?;
+        attn_weights = attn_weights.broadcast_add(&m)?;
     }
 
-    /// Fallback implementation
-    fn attention_basic(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-        scale: f64,
-    ) -> Result<Tensor> {
-        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+    let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+    attn_probs.matmul(v)
+}
 
-        if let Some(m) = mask {
-            // mask: (B, seq_len) -> (B, 1, 1, seq_len)
+/// Prepare SDPA format mask
+fn prepare_sdpa_mask(mask: Option<&Tensor>, q: &Tensor, n_heads: usize) -> Result<Option<Tensor>> {
+    match mask {
+        Some(m) => {
+            // mask: (B, seq_len) -> (B, n_heads, seq_len, seq_len)
+            let (b, _, seq_len, _) = q.dims4()?;
             let m = m.unsqueeze(1)?.unsqueeze(2)?;
-            let m = m.to_dtype(attn_weights.dtype())?;
-            // 1=valid, 0=padding -> 0=valid, -inf=padding
+            let m = m.to_dtype(q.dtype())?;
+            // SDPA uses additive mask: 0=valid, -inf=masked
             let m = ((m - 1.0)? * 1e9)?;
-            attn_weights = attn_weights.broadcast_add(&m)?;
+            // broadcast to (B, n_heads, seq_len, seq_len)
+            let m = m.broadcast_as((b, n_heads, seq_len, seq_len))?;
+            Ok(Some(m))
         }
-
-        let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        attn_probs.matmul(v)
-    }
-
-    /// Prepare SDPA format mask
-    fn prepare_sdpa_mask(&self, mask: Option<&Tensor>, q: &Tensor) -> Result<Option<Tensor>> {
-        match mask {
-            Some(m) => {
-                // mask: (B, seq_len) -> (B, n_heads, seq_len, seq_len)
-                let (b, _, seq_len, _) = q.dims4()?;
-                let m = m.unsqueeze(1)?.unsqueeze(2)?;
-                let m = m.to_dtype(q.dtype())?;
-                // SDPA uses additive mask: 0=valid, -inf=masked
-                let m = ((m - 1.0)? * 1e9)?;
-                // broadcast to (B, n_heads, seq_len, seq_len)
-                let m = m.broadcast_as((b, self.n_heads, seq_len, seq_len))?;
-                Ok(Some(m))
-            }
-            None => Ok(None),
-        }
+        None => Ok(None),
     }
 }
 

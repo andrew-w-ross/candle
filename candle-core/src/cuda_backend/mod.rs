@@ -435,6 +435,17 @@ impl<U: UnaryOpT> Map1 for U {
     }
 }
 
+/// How a dtype is spelled in a kernel name, which is not always how
+/// [`DType::as_str`] spells it: the fp8 kernels separate the exponent and
+/// mantissa widths, and `as_str` round-trips through `from_str` so it cannot
+/// follow. Every other fp8 op hardcodes the kernel spelling instead.
+fn kernel_dtype(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F8E4M3 => "f8_e4m3",
+        dtype => dtype.as_str(),
+    }
+}
+
 fn slice_ptr<T: DeviceRepr>(v: &CudaSlice<T>, lo: usize) -> (u64, cudarc::driver::SyncOnDrop<'_>) {
     let (_, guard) = v.device_ptr(v.stream());
     let (ptr, _) = v.slice(lo..).device_ptr(v.stream());
@@ -1575,7 +1586,7 @@ impl BackendStorage for CudaStorage {
         };
         let inp = &inp;
 
-        let kernel_name = format!("cast_{}_{}", self.dtype().as_str(), dtype.as_str());
+        let kernel_name = format!("cast_{}_{}", kernel_dtype(self.dtype()), kernel_dtype(dtype));
         let func = dev.get_or_load_func(&kernel_name, &kernels::CAST)?;
         let slice = match dtype {
             DType::U8 => {
@@ -2022,16 +2033,15 @@ impl BackendStorage for CudaStorage {
                 Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
             col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
         } else {
-            // Make the kernel contiguous if not already the case. copy_strided_src writes the
-            // materialized kernel starting at offset 0, so the matmul layout must use offset 0,
-            // not the original (strided) kernel's start offset.
+            // Make the kernel contiguous if not already the case.
             let mut kernel_c = unsafe {
                 self.device()
                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
             };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?;
-            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?
@@ -2108,6 +2118,92 @@ impl BackendStorage for CudaStorage {
                 Err(CudaError::InternalError("conv2d does not support f8e4m3"))?
             }
             _ => Err(CudaError::InternalError("dtype mismatch in conv2d"))?,
+        };
+        Ok(Self { slice, device })
+    }
+
+    #[cfg(not(feature = "cudnn"))]
+    fn conv3d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        crate::bail!("conv3d on cuda requires candle to be built with the cudnn feature")
+    }
+
+    #[cfg(feature = "cudnn")]
+    fn conv3d(
+        &self,
+        inp_l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        // cuDNN filter descriptors carry no strides, so a strided kernel has to be materialized.
+        let kernel_c;
+        let (kernel, kernel_l) = if kernel_l.is_contiguous() {
+            (kernel, kernel_l.clone())
+        } else {
+            let mut tmp = unsafe { device.alloc_uninit(kernel_l.shape(), kernel.dtype())? };
+            kernel.copy_strided_src(&mut tmp, 0, kernel_l)?;
+            kernel_c = tmp;
+            (&kernel_c, Layout::contiguous(kernel_l.shape()))
+        };
+        let kernel_l = &kernel_l;
+        let dst_el =
+            params.b_size * params.c_out * params.out_d() * params.out_h() * params.out_w();
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::U8(inp), S::U8(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                crate::cudnn::launch_conv3d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::U8(out)
+            }
+            (S::BF16(inp), S::BF16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                crate::cudnn::launch_conv3d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::BF16(out)
+            }
+            (S::F16(inp), S::F16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F16(out)
+            }
+            (S::F32(inp), S::F32(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F32(out)
+            }
+            (S::F64(inp), S::F64(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F64(out)
+            }
+            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv3d does not support u32"))?,
+            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv3d does not support i16"))?,
+            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv3d does not support i32"))?,
+            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv3d does not support i64"))?,
+            (S::F8E4M3(_), S::F8E4M3(_)) => {
+                Err(CudaError::InternalError("conv3d does not support f8e4m3"))?
+            }
+            _ => Err(CudaError::InternalError("dtype mismatch in conv3d"))?,
         };
         Ok(Self { slice, device })
     }

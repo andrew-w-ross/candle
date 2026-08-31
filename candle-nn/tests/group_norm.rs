@@ -103,3 +103,117 @@ fn group_norm() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(feature = "cuda")]
+mod fused_cuda {
+    use anyhow::Result;
+    use candle::{DType, Device, Tensor};
+    use candle_nn::{GroupNorm, Module};
+
+    fn max_abs_err(a: &Tensor, b: &Tensor) -> Result<f64> {
+        let a = a.flatten_all()?.to_dtype(DType::F64)?.to_vec1::<f64>()?;
+        let b = b.flatten_all()?.to_dtype(DType::F64)?.to_vec1::<f64>()?;
+        Ok(a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f64, f64::max))
+    }
+
+    fn check(dims: &[usize], num_groups: usize, dtype: DType) -> Result<(f64, f64)> {
+        let cpu = Device::Cpu;
+        let cuda = Device::new_cuda(0)?;
+        let n_channels = dims[1];
+        let eps = 1e-5;
+
+        let x = Tensor::randn(0.5f32, 3.0f32, dims, &cpu)?;
+        let w = Tensor::randn(1f32, 0.3f32, n_channels, &cpu)?;
+        let b = Tensor::randn(0f32, 0.3f32, n_channels, &cpu)?;
+
+        // f64 reference on cpu, going through the unfused implementation.
+        let gn = GroupNorm::new(
+            w.to_dtype(DType::F64)?,
+            b.to_dtype(DType::F64)?,
+            n_channels,
+            num_groups,
+            eps,
+        )?;
+        let reference = gn.forward(&x.to_dtype(DType::F64)?)?;
+
+        // the existing unfused path, at the tested dtype, on cpu.
+        let gn = GroupNorm::new(
+            w.to_dtype(dtype)?,
+            b.to_dtype(dtype)?,
+            n_channels,
+            num_groups,
+            eps,
+        )?;
+        let unfused = gn.forward(&x.to_dtype(dtype)?)?;
+
+        // the fused cuda kernel.
+        let gn = GroupNorm::new(
+            w.to_device(&cuda)?.to_dtype(dtype)?,
+            b.to_device(&cuda)?.to_dtype(dtype)?,
+            n_channels,
+            num_groups,
+            eps,
+        )?;
+        let fused = gn
+            .forward(&x.to_device(&cuda)?.to_dtype(dtype)?)?
+            .to_device(&cpu)?;
+
+        assert_eq!(fused.dims(), dims);
+        Ok((
+            max_abs_err(&fused, &reference)?,
+            max_abs_err(&unfused, &reference)?,
+        ))
+    }
+
+    fn report(
+        name: &str,
+        dims: &[usize],
+        num_groups: usize,
+        dtype: DType,
+        bound: f64,
+    ) -> Result<()> {
+        let (fused, unfused) = check(dims, num_groups, dtype)?;
+        println!(
+            "{name} {dims:?} groups={num_groups} {dtype:?}: fused {fused:e} unfused {unfused:e}"
+        );
+        assert!(
+            fused <= bound,
+            "{name}: fused error {fused:e} exceeds {bound:e}"
+        );
+        assert!(
+            fused <= unfused * 1.5 + 1e-6,
+            "{name}: fused error {fused:e} is worse than the unfused {unfused:e}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sdxl_shapes() -> Result<()> {
+        report("sdxl-320", &[2, 320, 128, 128], 32, DType::F16, 8e-3)?;
+        report("sdxl-640", &[2, 640, 64, 64], 32, DType::F16, 8e-3)?;
+        report("sdxl-1280", &[2, 1280, 32, 32], 32, DType::F16, 8e-3)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tail_shapes() -> Result<()> {
+        // hidden_size = 2178, not a multiple of the 1024-thread block, over a
+        // spatial extent that is not a power of two.
+        report("tail-2178", &[2, 64, 33, 33], 32, DType::F16, 8e-3)?;
+        // hidden_size = 182, smaller than one block.
+        report("tail-182", &[3, 64, 7, 13], 32, DType::F16, 8e-3)?;
+        // rank 3, one channel per group.
+        report("tail-rank3", &[2, 32, 1000], 32, DType::F16, 8e-3)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_shapes() -> Result<()> {
+        report("bf16-640", &[2, 640, 64, 64], 32, DType::BF16, 7e-2)?;
+        report("bf16-tail", &[2, 64, 33, 33], 32, DType::BF16, 7e-2)?;
+        Ok(())
+    }
+}

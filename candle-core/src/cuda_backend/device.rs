@@ -63,6 +63,7 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    blaslt: Arc<Mutex<Option<Arc<cudarc::cublaslt::CudaBlasLT>>>>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
 }
@@ -381,6 +382,25 @@ impl CudaDevice {
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
         self.blas.clone()
     }
+
+    /// The cublasLt handle for this device, created on first use. It owns a
+    /// multi-megabyte workspace, so devices that never run a cublasLt matmul
+    /// never pay for one.
+    pub fn cublaslt_handle(&self) -> Result<Arc<cudarc::cublaslt::CudaBlasLT>> {
+        let Ok(mut guard) = self.blaslt.lock() else {
+            crate::bail!("the cublasLt handle mutex is poisoned")
+        };
+        match guard.as_ref() {
+            Some(lt) => Ok(lt.clone()),
+            None => {
+                let lt = cudarc::cublaslt::CudaBlasLT::new(self.stream.clone())
+                    .map_err(crate::Error::wrap)?;
+                let lt = Arc::new(lt);
+                *guard = Some(lt.clone());
+                Ok(lt)
+            }
+        }
+    }
 }
 
 impl CudaDevice {
@@ -404,6 +424,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            blaslt: Arc::new(Mutex::new(None)),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

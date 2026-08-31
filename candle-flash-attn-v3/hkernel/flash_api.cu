@@ -206,7 +206,6 @@ extern "C" void run_mha_v3(
     void *o_ptr,
     void *softmax_lse_ptr,
     void *alibi_slopes_ptr,
-    int32_t *tile_count_semaphore_ptr,
 
     int32_t *cu_seqlens_q_ptr,
     int32_t *cu_seqlens_k_ptr,
@@ -248,9 +247,7 @@ extern "C" void run_mha_v3(
     int window_size_right,
 
     uint32_t total_q,
-    uint32_t total_k,
-
-    void *stream_ptr
+    uint32_t total_k
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -264,8 +261,6 @@ extern "C" void run_mha_v3(
 
     params.softmax_lse_ptr = softmax_lse_ptr;
     params.alibi_slopes_ptr = alibi_slopes_ptr;
-    // Causal/local/split select DynamicPersistentTileScheduler, which atomicAdds this counter.
-    params.tile_count_semaphore = tile_count_semaphore_ptr;
 
     // All stride are in elements, not bytes.
     params.q_batch_stride = q_batch_stride;
@@ -325,12 +320,10 @@ extern "C" void run_mha_v3(
     params.total_k = total_k;
 
     params.unpadded_lse = unpadded_lse;
-    // The GQA-packed launchers hardcode FixedSeqLenTraits, so they read straight past cu_seqlens.
-    params.use_gqa_packing = cu_seqlens_q_ptr != nullptr ? 0 : use_gqa_packing;
+    params.use_gqa_packing = use_gqa_packing;
 
     // print_params(params);
     
-    // candle's streams are cudaStreamNonBlocking, so they do not sync with the legacy default stream.
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaStream_t stream = 0; // Use the default stream.
     run_mha_fwd_v3(params, stream);
 }
