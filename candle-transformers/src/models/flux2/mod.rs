@@ -1,4 +1,6 @@
-//! FLUX.2 (klein) — text-to-image flow matching from Black Forest Labs.
+//! FLUX.2 — text-to-image flow matching from Black Forest Labs. One module for
+//! klein and dev alike: they are the same architecture at different sizes, and
+//! every dimension that differs is in the config.
 //!
 //! - 🤗 [FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
 //!
@@ -9,13 +11,14 @@
 //! T5 plus a pooled CLIP vector, so there is no `y` input and no pooled
 //! projection.
 
+pub mod bfl;
 pub mod transformer;
 pub mod vae;
 
 pub use transformer::{Config, Flux2Transformer2DModel};
 pub use vae::AutoEncoderKL;
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 
 /// Coordinates for `len` text tokens: `(0, 0, 0, position)`, so text occupies the
 /// fourth rope axis alone and never collides with an image position.
@@ -95,6 +98,7 @@ pub fn sigma_schedule(image_seq_len: usize, num_steps: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle::IndexOp;
 
     /// Against `Flux2KleinPipeline`'s own schedule: a `linspace(1, 1/n, n)`
     /// warped by the empirical mu, with a terminal zero appended.
@@ -131,7 +135,9 @@ mod tests {
     #[test]
     #[ignore = "needs a reference dump; set FLUX2_REFERENCE"]
     fn matches_the_diffusers_reference() {
-        let path = std::env::var("FLUX2_REFERENCE").unwrap();
+        let Ok(path) = std::env::var("FLUX2_REFERENCE") else {
+            return;
+        };
         let device = Device::Cpu;
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &device).unwrap()
@@ -188,7 +194,9 @@ mod tests {
     fn conditioning_matches_the_transformers_reference() {
         use crate::models::z_image::{TextEncoderConfig, ZImageTextEncoder};
 
-        let path = std::env::var("FLUX2_TE_REFERENCE").unwrap();
+        let Ok(path) = std::env::var("FLUX2_TE_REFERENCE") else {
+            return;
+        };
         let device = Device::Cpu;
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &device).unwrap()
@@ -210,6 +218,46 @@ mod tests {
         let states = encoder.forward_hidden_states(&ids, 7, &[1, 2, 3]).unwrap();
         let cond = Tensor::cat(&states, candle::D::Minus1).unwrap();
         assert!(max_diff(&cond, &io.get((1, 12, 96), "cond").unwrap()) < 2e-5);
+    }
+
+    /// Prints a gguf's metadata and tensor names. Not an assertion: this is how
+    /// you find out what naming a quantized flux.2 file uses before writing a
+    /// loader for it.
+    #[test]
+    #[ignore = "prints a gguf's contents; set FLUX2_GGUF"]
+    fn describe_gguf() {
+        let Ok(path) = std::env::var("FLUX2_GGUF") else {
+            return;
+        };
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = candle::quantized::gguf_file::Content::read(&mut file).unwrap();
+        for (key, value) in &content.metadata {
+            println!("meta {key} = {value:?}");
+        }
+        println!("{} tensors", content.tensor_infos.len());
+        let mut names: Vec<_> = content.tensor_infos.iter().collect();
+        names.sort_by_key(|(name, _)| name.to_string());
+        for (name, info) in names {
+            println!("{name} {:?} {:?}", info.shape.dims(), info.ggml_dtype);
+        }
+    }
+
+    /// The same for a safetensors file, which is how you find out whether a
+    /// single-file checkpoint uses diffusers or BFL naming, and what dtype it
+    /// stores.
+    #[test]
+    #[ignore = "prints a safetensors file's contents; set FLUX2_SAFETENSORS"]
+    fn describe_safetensors() {
+        let Ok(path) = std::env::var("FLUX2_SAFETENSORS") else {
+            return;
+        };
+        let file = unsafe { candle::safetensors::MmapedSafetensors::new(&path).unwrap() };
+        let mut names: Vec<_> = file.tensors().into_iter().collect();
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        println!("{} tensors", names.len());
+        for (name, view) in names {
+            println!("{name} {:?} {:?}", view.shape(), view.dtype());
+        }
     }
 
     fn max_diff(a: &Tensor, b: &Tensor) -> f32 {

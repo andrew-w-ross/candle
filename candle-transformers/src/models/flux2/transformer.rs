@@ -19,6 +19,10 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32) -> Result<Tensor> {
     candle::bail!("flash-attn feature not enabled, compile with '--features flash-attn'")
 }
 
+/// Every `serde` default here is the value diffusers' own constructor uses, not
+/// klein's. They differ — those are FLUX.2-dev's numbers — but a partial config
+/// has to behave the way the reference would, and `klein_4b`/`klein_9b` name the
+/// presets we actually target.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     #[serde(default = "default_in_channels")]
@@ -45,7 +49,11 @@ pub struct Config {
     pub rope_theta: f64,
     #[serde(default = "default_eps")]
     pub eps: f64,
-    #[serde(default)]
+    /// True by default because that is diffusers' own default: klein's config
+    /// says `false` outright, but FLUX.2-dev omits the key entirely, and
+    /// defaulting to false there would silently leave its guidance embedder
+    /// unread.
+    #[serde(default = "default_true")]
     pub guidance_embeds: bool,
     #[serde(default = "default_use_accelerated_attn")]
     pub use_accelerated_attn: bool,
@@ -55,19 +63,19 @@ fn default_in_channels() -> usize {
     128
 }
 fn default_num_layers() -> usize {
-    5
+    8
 }
 fn default_num_single_layers() -> usize {
-    20
+    48
 }
 fn default_attention_head_dim() -> usize {
     128
 }
 fn default_num_attention_heads() -> usize {
-    24
+    48
 }
 fn default_joint_attention_dim() -> usize {
-    7680
+    15360
 }
 fn default_timestep_guidance_channels() -> usize {
     256
@@ -87,11 +95,8 @@ fn default_eps() -> f64 {
 fn default_use_accelerated_attn() -> bool {
     true
 }
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::klein_4b()
-    }
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -226,6 +231,13 @@ fn layer_norm(dim: usize, eps: f64, device: &Device, dtype: DType) -> Result<Lay
     ))
 }
 
+/// Every projection in the stack, without exception, is bias-free. Routing them
+/// all through one constructor leaves a quantized backend one line to replace
+/// rather than sixteen.
+fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
+    candle_nn::linear_no_bias(in_dim, out_dim, vb)
+}
+
 fn rms_norm(dim: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
     Ok(RmsNorm::new(vb.get(dim, "weight")?, eps))
 }
@@ -249,7 +261,7 @@ struct Modulation {
 
 impl Modulation {
     fn new(dim: usize, sets: usize, vb: VarBuilder) -> Result<Self> {
-        let linear = candle_nn::linear_no_bias(dim, dim * 3 * sets, vb.pp("linear"))?;
+        let linear = linear(dim, dim * 3 * sets, vb.pp("linear"))?;
         Ok(Self { linear, sets })
     }
 
@@ -278,8 +290,8 @@ struct FeedForward {
 impl FeedForward {
     fn new(dim: usize, inner_dim: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear_in: candle_nn::linear_no_bias(dim, inner_dim * 2, vb.pp("linear_in"))?,
-            linear_out: candle_nn::linear_no_bias(inner_dim, dim, vb.pp("linear_out"))?,
+            linear_in: linear(dim, inner_dim * 2, vb.pp("linear_in"))?,
+            linear_out: linear(inner_dim, dim, vb.pp("linear_out"))?,
             inner_dim,
         })
     }
@@ -322,20 +334,20 @@ impl JointAttention {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dim = cfg.inner_dim();
         let head_dim = cfg.attention_head_dim;
-        let linear = |name: &str| candle_nn::linear_no_bias(dim, dim, vb.pp(name));
+        let square = |name: &str| linear(dim, dim, vb.pp(name));
         Ok(Self {
-            to_q: linear("to_q")?,
-            to_k: linear("to_k")?,
-            to_v: linear("to_v")?,
+            to_q: square("to_q")?,
+            to_k: square("to_k")?,
+            to_v: square("to_v")?,
             norm_q: rms_norm(head_dim, cfg.eps, vb.pp("norm_q"))?,
             norm_k: rms_norm(head_dim, cfg.eps, vb.pp("norm_k"))?,
-            to_out: candle_nn::linear_no_bias(dim, dim, vb.pp("to_out").pp(0))?,
-            add_q_proj: linear("add_q_proj")?,
-            add_k_proj: linear("add_k_proj")?,
-            add_v_proj: linear("add_v_proj")?,
+            to_out: linear(dim, dim, vb.pp("to_out").pp(0))?,
+            add_q_proj: square("add_q_proj")?,
+            add_k_proj: square("add_k_proj")?,
+            add_v_proj: square("add_v_proj")?,
             norm_added_q: rms_norm(head_dim, cfg.eps, vb.pp("norm_added_q"))?,
             norm_added_k: rms_norm(head_dim, cfg.eps, vb.pp("norm_added_k"))?,
-            to_add_out: linear("to_add_out")?,
+            to_add_out: square("to_add_out")?,
             heads: cfg.num_attention_heads,
             head_dim,
             accelerated: cfg.use_accelerated_attn,
@@ -452,14 +464,14 @@ impl SingleStreamBlock {
         let vb_attn = vb.pp("attn");
         Ok(Self {
             norm: layer_norm(dim, cfg.eps, vb.device(), vb.dtype())?,
-            to_qkv_mlp_proj: candle_nn::linear_no_bias(
+            to_qkv_mlp_proj: linear(
                 dim,
                 dim * 3 + mlp_hidden_dim * 2,
                 vb_attn.pp("to_qkv_mlp_proj"),
             )?,
             norm_q: rms_norm(cfg.attention_head_dim, cfg.eps, vb_attn.pp("norm_q"))?,
             norm_k: rms_norm(cfg.attention_head_dim, cfg.eps, vb_attn.pp("norm_k"))?,
-            to_out: candle_nn::linear_no_bias(dim + mlp_hidden_dim, dim, vb_attn.pp("to_out"))?,
+            to_out: linear(dim + mlp_hidden_dim, dim, vb_attn.pp("to_out"))?,
             heads: cfg.num_attention_heads,
             head_dim: cfg.attention_head_dim,
             inner_dim: dim,
@@ -506,7 +518,7 @@ impl NormOut {
     fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             norm: layer_norm(dim, eps, vb.device(), vb.dtype())?,
-            linear: candle_nn::linear_no_bias(dim, dim * 2, vb.pp("linear"))?,
+            linear: linear(dim, dim * 2, vb.pp("linear"))?,
         })
     }
 
@@ -544,8 +556,8 @@ impl Flux2Transformer2DModel {
         let out_channels = cfg.out_channels.unwrap_or(cfg.in_channels);
         let embedder = |vb: VarBuilder| -> Result<(Linear, Linear)> {
             Ok((
-                candle_nn::linear_no_bias(cfg.timestep_guidance_channels, dim, vb.pp("linear_1"))?,
-                candle_nn::linear_no_bias(dim, dim, vb.pp("linear_2"))?,
+                linear(cfg.timestep_guidance_channels, dim, vb.pp("linear_1"))?,
+                linear(dim, dim, vb.pp("linear_2"))?,
             ))
         };
         let vb_time = vb.pp("time_guidance_embed");
@@ -584,8 +596,8 @@ impl Flux2Transformer2DModel {
                 vb.pp("double_stream_modulation_txt"),
             )?,
             single_stream_modulation: Modulation::new(dim, 1, vb.pp("single_stream_modulation"))?,
-            x_embedder: candle_nn::linear_no_bias(cfg.in_channels, dim, vb.pp("x_embedder"))?,
-            context_embedder: candle_nn::linear_no_bias(
+            x_embedder: linear(cfg.in_channels, dim, vb.pp("x_embedder"))?,
+            context_embedder: linear(
                 cfg.joint_attention_dim,
                 dim,
                 vb.pp("context_embedder"),
@@ -593,7 +605,7 @@ impl Flux2Transformer2DModel {
             double_blocks,
             single_blocks,
             norm_out: NormOut::new(dim, cfg.eps, vb.pp("norm_out"))?,
-            proj_out: candle_nn::linear_no_bias(dim, out_channels, vb.pp("proj_out"))?,
+            proj_out: linear(dim, out_channels, vb.pp("proj_out"))?,
             axes_dims_rope: cfg.axes_dims_rope.clone(),
             rope_theta: cfg.rope_theta,
             timestep_channels: cfg.timestep_guidance_channels,
