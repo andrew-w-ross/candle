@@ -17,6 +17,8 @@
 //! and then shifted by the blob's `nested_offset`. Every one of those numbers is
 //! per-tensor, so they are read from the blob and never assumed — a dropped
 //! `nested_offset` biases the whole tensor and still produces a picture.
+use rayon::prelude::*;
+
 use crate::{DType, Result, Shape, Tensor};
 
 /// The `quant_state.bitsandbytes__nf4` blob, as the file writes it.
@@ -164,16 +166,17 @@ impl Nf4Weight<'_> {
             .collect();
 
         let mut out = vec![0f32; padded];
-        for (block, chunk) in packed.chunks(state.blocksize / 2).enumerate() {
-            let scale = scales[block];
-            let dst = &mut out[block * state.blocksize..(block + 1) * state.blocksize];
-            for (i, &byte) in chunk.iter().enumerate() {
-                // Element 2i is the high nibble, 2i+1 the low: bitsandbytes
-                // shifts the first of the pair up when it packs the byte.
-                dst[2 * i] = codes[(byte >> 4) as usize] * scale;
-                dst[2 * i + 1] = codes[(byte & 0x0f) as usize] * scale;
-            }
-        }
+        out.par_chunks_mut(state.blocksize)
+            .zip(packed.par_chunks(state.blocksize / 2))
+            .zip(scales.par_iter())
+            .for_each(|((dst, chunk), &scale)| {
+                for (i, &byte) in chunk.iter().enumerate() {
+                    // Element 2i is the high nibble, 2i+1 the low: bitsandbytes
+                    // shifts the first of the pair up when it packs the byte.
+                    dst[2 * i] = codes[(byte >> 4) as usize] * scale;
+                    dst[2 * i + 1] = codes[(byte & 0x0f) as usize] * scale;
+                }
+            });
         out.truncate(n);
 
         let shape = Shape::from(state.shape);
