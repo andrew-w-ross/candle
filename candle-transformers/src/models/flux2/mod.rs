@@ -220,6 +220,111 @@ mod tests {
         assert!(max_diff(&cond, &io.get((1, 12, 96), "cond").unwrap()) < 2e-5);
     }
 
+    /// The cuda backend against the cpu one, same weights and same input. The
+    /// port already matches diffusers on the cpu, so what this asks is narrower
+    /// and sharper: whether a kernel, a layout assumption or a dtype promotion
+    /// makes cuda disagree with the path that was verified.
+    #[test]
+    #[ignore = "needs a reference dump and a cuda device; set FLUX2_REFERENCE"]
+    fn cpu_and_cuda_agree() {
+        let Ok(path) = std::env::var("FLUX2_REFERENCE") else {
+            return;
+        };
+        let Ok(cuda) = Device::new_cuda(0) else {
+            println!("no cuda device; skipped");
+            return;
+        };
+
+        let cfg = Config {
+            in_channels: 16,
+            num_layers: 2,
+            num_single_layers: 2,
+            attention_head_dim: 32,
+            num_attention_heads: 2,
+            joint_attention_dim: 24,
+            axes_dims_rope: vec![8, 8, 8, 8],
+            use_accelerated_attn: false,
+            ..Config::klein_4b()
+        };
+
+        let run = |device: &Device| {
+            let vb = unsafe {
+                candle_nn::VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, device)
+                    .unwrap()
+            };
+            let model = Flux2Transformer2DModel::new(&cfg, vb.pp("model")).unwrap();
+            let io = vb.pp("io");
+            model
+                .forward(
+                    &io.get((1, 12, 16), "img").unwrap(),
+                    &latent_ids(3, 4, device).unwrap(),
+                    &io.get((1, 5, 24), "txt").unwrap(),
+                    &text_ids(5, device).unwrap(),
+                    &io.get(1, "t").unwrap(),
+                    None,
+                )
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+        };
+
+        assert!(max_diff(&run(&Device::Cpu), &run(&cuda)) < 1e-4);
+    }
+
+    /// One forward pass of klein-9B read straight out of a scaled-fp8 checkpoint
+    /// in BFL naming. `covers_a_real_checkpoint` proves the key map; this is the
+    /// only thing that exercises the dequant arithmetic and the qkv and
+    /// modulation splits on real weights.
+    #[test]
+    #[ignore = "needs the fp8 9B checkpoint and a cuda device; set FLUX2_FP8"]
+    fn fp8_klein_9b_runs() {
+        let Ok(path) = std::env::var("FLUX2_FP8") else {
+            return;
+        };
+        let Ok(device) = Device::new_cuda(0) else {
+            println!("no cuda device; skipped");
+            return;
+        };
+        let vb = unsafe { bfl::var_builder(&[&path], DType::BF16, &device).unwrap() };
+        let cfg = Config::klein_9b();
+        let model = Flux2Transformer2DModel::new(&cfg, vb).unwrap();
+
+        let (rows, cols, txt_len) = (8, 8, 16);
+        let img = Tensor::randn(0f32, 1f32, (1, rows * cols, 128), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let txt = Tensor::randn(0f32, 1f32, (1, txt_len, cfg.joint_attention_dim), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let t = Tensor::from_vec(vec![0.7f32], 1, &device).unwrap();
+        let out = model
+            .forward(
+                &img,
+                &latent_ids(rows, cols, &device).unwrap(),
+                &txt,
+                &text_ids(txt_len, &device).unwrap(),
+                &t,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(out.dims(), &[1, rows * cols, 128]);
+        let finite = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bad = finite.iter().filter(|v| !v.is_finite()).count();
+        let mean = finite.iter().map(|v| v.abs()).sum::<f32>() / finite.len() as f32;
+        println!("fp8 9B forward: {} values, {bad} non-finite, mean abs {mean}", finite.len());
+        assert_eq!(bad, 0);
+        assert!(mean > 1e-3 && mean < 1e3, "output collapsed or exploded: {mean}");
+    }
+
     /// Prints a gguf's metadata and tensor names. Not an assertion: this is how
     /// you find out what naming a quantized flux.2 file uses before writing a
     /// loader for it.
