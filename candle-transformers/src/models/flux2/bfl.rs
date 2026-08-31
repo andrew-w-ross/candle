@@ -138,21 +138,42 @@ fn block_of<'a>(prefix: &str, name: &'a str) -> Option<(&'a str, &'a str)> {
     name.strip_prefix(prefix)?.split_once('.')
 }
 
+/// How a stored name is reached from the name the model asks for.
+type Translate = fn(&str) -> Option<(String, Take)>;
+
+/// A checkpoint that stores its own names, adding a `weight_scale` beside each
+/// quantized weight. ComfyUI's text encoder exports are this: transformers'
+/// naming, some tensors in fp8, nothing renamed or reordered.
+fn identity(name: &str) -> Option<(String, Take)> {
+    Some((name.to_string(), Take::Whole))
+}
+
 struct Bfl {
     weights: MmapedSafetensors,
     names: HashSet<String>,
+    translate: Translate,
 }
 
 impl Bfl {
     /// The stored weight, cast to `dtype` and scaled if the file quantised it.
+    ///
+    /// Only per-tensor scaling is handled, which is a scalar multiply. A second
+    /// scale beside the first means block-wise nvfp4: the weight is then two
+    /// 4-bit values to a byte with fp8 block scales, which needs an unpack candle
+    /// does not have. Refuse by name rather than letting the shapes collide
+    /// somewhere further in.
     fn weight(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
-        let tensor = self.weights.load(name, device)?.to_dtype(dtype)?;
-        let Some(scale) = name
-            .strip_suffix(".weight")
-            .map(|base| format!("{base}.weight_scale"))
-        else {
-            return Ok(tensor);
+        let Some(base) = name.strip_suffix(".weight") else {
+            return self.weights.load(name, device)?.to_dtype(dtype);
         };
+        if self.names.contains(&format!("{base}.weight_scale_2")) {
+            candle::bail!(
+                "{name} is nvfp4: 4-bit values packed two to a byte with fp8 block scales, \
+                 which this cannot unpack. Use an fp8 or bf16 copy of this component."
+            )
+        }
+        let tensor = self.weights.load(name, device)?.to_dtype(dtype)?;
+        let scale = format!("{base}.weight_scale");
         if !self.names.contains(&scale) {
             return Ok(tensor);
         }
@@ -169,8 +190,8 @@ impl SimpleBackend for Bfl {
         dtype: DType,
         device: &Device,
     ) -> Result<Tensor> {
-        let Some((from, take)) = translate(name) else {
-            candle::bail!("{name} has no counterpart in black forest labs naming")
+        let Some((from, take)) = (self.translate)(name) else {
+            candle::bail!("{name} has no counterpart in this checkpoint's naming")
         };
         let tensor = self.weight(&from, dtype, device)?;
         let tensor = match take {
@@ -197,14 +218,14 @@ impl SimpleBackend for Bfl {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        translate(name).is_some_and(|(from, _)| self.names.contains(&from))
+        (self.translate)(name).is_some_and(|(from, _)| self.names.contains(&from))
     }
 
     /// Only reachable without a shape to check against, so the caller gets
     /// whatever the file holds.
     fn get_unchecked(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
-        let Some((from, _)) = translate(name) else {
-            candle::bail!("{name} has no counterpart in black forest labs naming")
+        let Some((from, _)) = (self.translate)(name) else {
+            candle::bail!("{name} has no counterpart in this checkpoint's naming")
         };
         self.weight(&from, dtype, device)
     }
@@ -219,10 +240,37 @@ pub unsafe fn var_builder<'a, P: AsRef<Path>>(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'a>> {
+    unsafe { backend(paths, dtype, device, translate) }
+}
+
+/// A [`VarBuilder`] over a checkpoint that keeps the names the model already
+/// asks for but stores some tensors as scaled fp8 — ComfyUI's text encoder
+/// exports. Only the dequant is shared with the BFL path; nothing is renamed.
+///
+/// # Safety
+/// The files must not be written to while the mapping is live.
+pub unsafe fn scaled_var_builder<'a, P: AsRef<Path>>(
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'a>> {
+    unsafe { backend(paths, dtype, device, identity) }
+}
+
+unsafe fn backend<'a, P: AsRef<Path>>(
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+    translate: Translate,
+) -> Result<VarBuilder<'a>> {
     let weights = unsafe { MmapedSafetensors::multi(paths)? };
     let names = weights.tensors().into_iter().map(|(name, _)| name).collect();
     Ok(VarBuilder::from_backend(
-        Box::new(Bfl { weights, names }),
+        Box::new(Bfl {
+            weights,
+            names,
+            translate,
+        }),
         dtype,
         device.clone(),
     ))

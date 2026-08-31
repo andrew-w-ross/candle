@@ -424,7 +424,13 @@ mod tests {
         names.sort_by(|a, b| a.0.cmp(&b.0));
         println!("{} tensors", names.len());
         for (name, view) in names {
-            println!("{name} {:?} {:?}", view.shape(), view.dtype());
+            // A small byte tensor is far more likely to be a label than a
+            // packed weight, and reading it settles which.
+            let text = (format!("{:?}", view.dtype()) == "U8"
+                && view.shape().iter().product::<usize>() <= 64)
+                .then(|| String::from_utf8_lossy(view.data()).to_string())
+                .unwrap_or_default();
+            println!("{name} {:?} {:?} {text}", view.shape(), view.dtype());
         }
     }
 
