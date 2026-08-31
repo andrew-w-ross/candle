@@ -157,27 +157,67 @@ struct Bfl {
 impl Bfl {
     /// The stored weight, cast to `dtype` and scaled if the file quantised it.
     ///
-    /// Only per-tensor scaling is handled, which is a scalar multiply. A second
-    /// scale beside the first means block-wise nvfp4: the weight is then two
-    /// 4-bit values to a byte with fp8 block scales, which needs an unpack candle
-    /// does not have. Refuse by name rather than letting the shapes collide
-    /// somewhere further in.
+    /// A stored weight in `dtype`, undoing whatever quantisation the file used.
+    ///
+    /// Three schemes appear, sometimes inside one file: plain, per-tensor scaled
+    /// fp8 (a scalar multiply), and nvfp4, which a second scale beside the first
+    /// identifies. Anything else still refuses by name rather than letting the
+    /// shapes collide somewhere further in.
     fn weight(&self, name: &str, dtype: DType, device: &Device) -> Result<Tensor> {
         let Some(base) = name.strip_suffix(".weight") else {
             return self.weights.load(name, device)?.to_dtype(dtype);
         };
-        if self.names.contains(&format!("{base}.weight_scale_2")) {
-            candle::bail!(
-                "{name} is nvfp4: 4-bit values packed two to a byte with fp8 block scales, \
-                 which this cannot unpack. Use an fp8 or bf16 copy of this component."
-            )
+        let scale = format!("{base}.weight_scale");
+        let global = format!("{base}.weight_scale_2");
+        if self.names.contains(&global) {
+            return self.nvfp4(name, base, &scale, &global, dtype, device);
         }
         let tensor = self.weights.load(name, device)?.to_dtype(dtype)?;
-        let scale = format!("{base}.weight_scale");
         if !self.names.contains(&scale) {
             return Ok(tensor);
         }
-        tensor.broadcast_mul(&self.weights.load(&scale, device)?.to_dtype(dtype)?)
+        let scale = self.weights.load(&scale, device)?;
+        if scale.rank() != 0 {
+            candle::bail!(
+                "{name} has a {:?} weight_scale and no weight_scale_2: neither a per-tensor \
+                 fp8 scale nor an nvfp4 block scale, so this cannot dequantize it",
+                scale.shape()
+            )
+        }
+        tensor.broadcast_mul(&scale.to_dtype(dtype)?)
+    }
+
+    /// Nvfp4: 4-bit values packed two to a byte, fp8 scales over blocks of
+    /// sixteen along the input dim, and one f32 scale for the tensor. Two
+    /// packers write this format with opposite nibble orders, so the file has to
+    /// say which one it was.
+    ///
+    /// The unpack is cpu-only, so this is the one place weights are built on the
+    /// host and moved across rather than loaded straight onto the device.
+    fn nvfp4(
+        &self,
+        name: &str,
+        base: &str,
+        scale: &str,
+        global: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let cpu = Device::Cpu;
+        let weight = self.weights.load(name, &cpu)?;
+        // Which half of the byte holds element 2i is a property of the packer,
+        // and the file records the packer: comfy labels every tensor it wrote,
+        // ModelOpt exports carry no such key. Reading it is the difference
+        // between a clean image and a plausible, badly degraded one.
+        let weight = if self.names.contains(&format!("{base}.comfy_quant")) {
+            swap_nibbles(&weight)?
+        } else {
+            weight
+        };
+        let block_scale = self.weights.load(scale, &cpu)?;
+        let global = self.weights.load(global, &cpu)?.to_dtype(DType::F32)?;
+        let global = global.to_scalar::<f32>()?;
+        candle::nvfp4::dequantize(&weight, &block_scale, global, dtype)?.to_device(device)
     }
 }
 
@@ -229,6 +269,15 @@ impl SimpleBackend for Bfl {
         };
         self.weight(&from, dtype, device)
     }
+}
+
+/// Exchanges the two nibbles of every byte, which is the difference between
+/// ModelOpt's packing order and ComfyUI's.
+fn swap_nibbles(weight: &Tensor) -> Result<Tensor> {
+    let bytes = weight.to_dtype(DType::F32)?;
+    let high = (bytes.clone() / 16.0)?.floor()?;
+    let low = (bytes - (high.clone() * 16.0)?)?;
+    ((low * 16.0)? + high)?.to_dtype(DType::U8)
 }
 
 /// A [`VarBuilder`] reading `paths` under Black Forest Labs' naming.
