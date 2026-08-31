@@ -1586,7 +1586,11 @@ impl BackendStorage for CudaStorage {
         };
         let inp = &inp;
 
-        let kernel_name = format!("cast_{}_{}", kernel_dtype(self.dtype()), kernel_dtype(dtype));
+        let kernel_name = format!(
+            "cast_{}_{}",
+            kernel_dtype(self.dtype()),
+            kernel_dtype(dtype)
+        );
         let func = dev.get_or_load_func(&kernel_name, &kernels::CAST)?;
         let slice = match dtype {
             DType::U8 => {

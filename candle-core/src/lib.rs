@@ -73,6 +73,7 @@ pub mod metal_backend;
 mod mkl;
 pub mod nditer;
 pub mod npy;
+pub mod nvfp4;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
