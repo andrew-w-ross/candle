@@ -46,6 +46,20 @@ fn check_shapes(content: &Content, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Whether `path` is a Z-Image transformer this configuration can load.
+///
+/// A gguf carries no diffusers `config.json`, so a listing that identifies a
+/// family by the declared denoiser class has nothing to read. This is what it
+/// reads instead — and it is the stronger test, since the weights cannot
+/// disagree with themselves. Validate on shapes, never on the declared
+/// `general.architecture`: both published z-image ggufs claim `lumina2`.
+pub fn is_z_image_gguf<P: AsRef<std::path::Path>>(cfg: &Config, path: P) -> bool {
+    let Ok(mut file) = std::fs::File::open(path.as_ref()) else {
+        return false;
+    };
+    Content::read(&mut file).is_ok_and(|content| check_shapes(&content, cfg).is_ok())
+}
+
 /// A GGUF weight file held open, read by tensor name.
 pub struct Gguf<R: std::io::Read + std::io::Seek> {
     content: Content,
