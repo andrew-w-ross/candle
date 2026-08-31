@@ -6,8 +6,13 @@
 //! stream is a parallel block with attention and MLP sharing both projections,
 //! RoPE runs over four axes, and nothing carries a bias.
 
+use std::io::{Read, Seek};
+
+use candle::quantized::QMatMul;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+
+use super::gguf::Gguf;
 
 #[cfg(feature = "flash-attn")]
 fn flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
@@ -231,11 +236,43 @@ fn layer_norm(dim: usize, eps: f64, device: &Device, dtype: DType) -> Result<Lay
     ))
 }
 
-/// Every projection in the stack, without exception, is bias-free. Routing them
-/// all through one constructor leaves a quantized backend one line to replace
-/// rather than sixteen.
-fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
-    candle_nn::linear_no_bias(in_dim, out_dim, vb)
+/// A projection, dense or quantized. Every one in this stack is bias-free, so
+/// there is nothing else to carry.
+///
+/// The two variants exist so that the forward pass is written once: a gguf
+/// klein and a diffusers klein differ in how their weights are stored and named,
+/// never in what the model computes, and a second copy of the arithmetic is a
+/// second thing that can drift.
+#[derive(Debug, Clone)]
+pub enum Proj {
+    Dense(Linear),
+    Quantized(QMatMul),
+}
+
+impl Module for Proj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(linear) => linear.forward(xs),
+            Self::Quantized(matmul) => matmul.forward(xs),
+        }
+    }
+}
+
+fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Proj> {
+    Ok(Proj::Dense(candle_nn::linear_no_bias(in_dim, out_dim, vb)?))
+}
+
+/// The three projections a diffusers checkpoint stores apart, stacked into the
+/// one tensor BFL stores them as. Concatenating the rows and splitting the
+/// product is exactly the separate matmuls, and it is the shape a quantized
+/// checkpoint has no choice about: k-quant blocks run along the input, so a
+/// fused weight cannot be sliced but its output can.
+fn fused_qkv(dim: usize, names: [&str; 3], vb: &VarBuilder) -> Result<Proj> {
+    let parts = names
+        .iter()
+        .map(|name| vb.get((dim, dim), &format!("{name}.weight")))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Proj::Dense(Linear::new(Tensor::cat(&parts, 0)?, None)))
 }
 
 fn rms_norm(dim: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
@@ -255,7 +292,7 @@ fn norm_heads(xs: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
 /// the whole stack at once, rather than FLUX.1's per-block modulation.
 #[derive(Debug, Clone)]
 struct Modulation {
-    linear: Linear,
+    linear: Proj,
     sets: usize,
 }
 
@@ -263,6 +300,13 @@ impl Modulation {
     fn new(dim: usize, sets: usize, vb: VarBuilder) -> Result<Self> {
         let linear = linear(dim, dim * 3 * sets, vb.pp("linear"))?;
         Ok(Self { linear, sets })
+    }
+
+    fn from_gguf<R: Read + Seek>(sets: usize, name: &str, g: &mut Gguf<R>) -> Result<Self> {
+        Ok(Self {
+            linear: g.proj(name)?,
+            sets,
+        })
     }
 
     /// `3 * sets` tensors of shape `(batch, 1, dim)`, in shift/scale/gate order.
@@ -282,8 +326,8 @@ fn scale_shift(xs: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
 /// first half of its output gates the second.
 #[derive(Debug, Clone)]
 struct FeedForward {
-    linear_in: Linear,
-    linear_out: Linear,
+    linear_in: Proj,
+    linear_out: Proj,
     inner_dim: usize,
 }
 
@@ -292,6 +336,18 @@ impl FeedForward {
         Ok(Self {
             linear_in: linear(dim, inner_dim * 2, vb.pp("linear_in"))?,
             linear_out: linear(inner_dim, dim, vb.pp("linear_out"))?,
+            inner_dim,
+        })
+    }
+
+    fn from_gguf<R: Read + Seek>(
+        inner_dim: usize,
+        name: &str,
+        g: &mut Gguf<R>,
+    ) -> Result<Self> {
+        Ok(Self {
+            linear_in: g.proj(&format!("{name}.0"))?,
+            linear_out: g.proj(&format!("{name}.2"))?,
             inner_dim,
         })
     }
@@ -313,18 +369,14 @@ fn swiglu(xs: &Tensor, half: usize) -> Result<Tensor> {
 /// split again for their separate output projections.
 #[derive(Debug, Clone)]
 struct JointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
+    qkv: Proj,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
-    to_out: Linear,
-    add_q_proj: Linear,
-    add_k_proj: Linear,
-    add_v_proj: Linear,
+    to_out: Proj,
+    add_qkv: Proj,
     norm_added_q: RmsNorm,
     norm_added_k: RmsNorm,
-    to_add_out: Linear,
+    to_add_out: Proj,
     heads: usize,
     head_dim: usize,
     accelerated: bool,
@@ -334,29 +386,43 @@ impl JointAttention {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dim = cfg.inner_dim();
         let head_dim = cfg.attention_head_dim;
-        let square = |name: &str| linear(dim, dim, vb.pp(name));
         Ok(Self {
-            to_q: square("to_q")?,
-            to_k: square("to_k")?,
-            to_v: square("to_v")?,
+            qkv: fused_qkv(dim, ["to_q", "to_k", "to_v"], &vb)?,
             norm_q: rms_norm(head_dim, cfg.eps, vb.pp("norm_q"))?,
             norm_k: rms_norm(head_dim, cfg.eps, vb.pp("norm_k"))?,
             to_out: linear(dim, dim, vb.pp("to_out").pp(0))?,
-            add_q_proj: square("add_q_proj")?,
-            add_k_proj: square("add_k_proj")?,
-            add_v_proj: square("add_v_proj")?,
+            add_qkv: fused_qkv(dim, ["add_q_proj", "add_k_proj", "add_v_proj"], &vb)?,
             norm_added_q: rms_norm(head_dim, cfg.eps, vb.pp("norm_added_q"))?,
             norm_added_k: rms_norm(head_dim, cfg.eps, vb.pp("norm_added_k"))?,
-            to_add_out: square("to_add_out")?,
+            to_add_out: linear(dim, dim, vb.pp("to_add_out"))?,
             heads: cfg.num_attention_heads,
             head_dim,
             accelerated: cfg.use_accelerated_attn,
         })
     }
 
-    fn heads_of(&self, xs: &Tensor) -> Result<Tensor> {
+    fn from_gguf<R: Read + Seek>(cfg: &Config, name: &str, g: &mut Gguf<R>) -> Result<Self> {
+        Ok(Self {
+            qkv: g.proj(&format!("{name}.img_attn.qkv"))?,
+            norm_q: g.qk_norm(&format!("{name}.img_attn.norm.query_norm"), cfg.eps)?,
+            norm_k: g.qk_norm(&format!("{name}.img_attn.norm.key_norm"), cfg.eps)?,
+            to_out: g.proj(&format!("{name}.img_attn.proj"))?,
+            add_qkv: g.proj(&format!("{name}.txt_attn.qkv"))?,
+            norm_added_q: g.qk_norm(&format!("{name}.txt_attn.norm.query_norm"), cfg.eps)?,
+            norm_added_k: g.qk_norm(&format!("{name}.txt_attn.norm.key_norm"), cfg.eps)?,
+            to_add_out: g.proj(&format!("{name}.txt_attn.proj"))?,
+            heads: cfg.num_attention_heads,
+            head_dim: cfg.attention_head_dim,
+            accelerated: cfg.use_accelerated_attn,
+        })
+    }
+
+    /// Splits a fused qkv product into three `(batch, seq, heads, head_dim)`
+    /// tensors, in q, k, v row order.
+    fn split_qkv(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, seq, _) = xs.dims3()?;
-        xs.reshape((b, seq, self.heads, self.head_dim))
+        let qkv = xs.reshape((b, seq, 3, self.heads, self.head_dim))?;
+        Ok((qkv.i((.., .., 0))?, qkv.i((.., .., 1))?, qkv.i((.., .., 2))?))
     }
 
     /// Returns `(image, text)` attention outputs, each already projected out.
@@ -367,13 +433,13 @@ impl JointAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let q = norm_heads(&self.heads_of(&img.apply(&self.to_q)?)?, &self.norm_q)?;
-        let k = norm_heads(&self.heads_of(&img.apply(&self.to_k)?)?, &self.norm_k)?;
-        let v = self.heads_of(&img.apply(&self.to_v)?)?;
+        let (q, k, v) = self.split_qkv(&img.apply(&self.qkv)?)?;
+        let q = norm_heads(&q, &self.norm_q)?;
+        let k = norm_heads(&k, &self.norm_k)?;
 
-        let tq = norm_heads(&self.heads_of(&txt.apply(&self.add_q_proj)?)?, &self.norm_added_q)?;
-        let tk = norm_heads(&self.heads_of(&txt.apply(&self.add_k_proj)?)?, &self.norm_added_k)?;
-        let tv = self.heads_of(&txt.apply(&self.add_v_proj)?)?;
+        let (tq, tk, tv) = self.split_qkv(&txt.apply(&self.add_qkv)?)?;
+        let tq = norm_heads(&tq, &self.norm_added_q)?;
+        let tk = norm_heads(&tk, &self.norm_added_k)?;
 
         let q = apply_rope(&Tensor::cat(&[&tq, &q], 1)?, cos, sin)?;
         let k = apply_rope(&Tensor::cat(&[&tk, &k], 1)?, cos, sin)?;
@@ -414,6 +480,27 @@ impl DoubleStreamBlock {
         })
     }
 
+    fn from_gguf<R: Read + Seek>(
+        cfg: &Config,
+        name: &str,
+        device: &Device,
+        dtype: DType,
+        g: &mut Gguf<R>,
+    ) -> Result<Self> {
+        let dim = cfg.inner_dim();
+        let inner = cfg.mlp_hidden_dim();
+        let norm = || layer_norm(dim, cfg.eps, device, dtype);
+        Ok(Self {
+            norm1: norm()?,
+            norm1_context: norm()?,
+            attn: JointAttention::from_gguf(cfg, name, g)?,
+            norm2: norm()?,
+            ff: FeedForward::from_gguf(inner, &format!("{name}.img_mlp"), g)?,
+            norm2_context: norm()?,
+            ff_context: FeedForward::from_gguf(inner, &format!("{name}.txt_mlp"), g)?,
+        })
+    }
+
     fn forward(
         &self,
         img: &Tensor,
@@ -446,10 +533,10 @@ impl DoubleStreamBlock {
 #[derive(Debug, Clone)]
 struct SingleStreamBlock {
     norm: LayerNorm,
-    to_qkv_mlp_proj: Linear,
+    to_qkv_mlp_proj: Proj,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
-    to_out: Linear,
+    to_out: Proj,
     heads: usize,
     head_dim: usize,
     inner_dim: usize,
@@ -476,6 +563,27 @@ impl SingleStreamBlock {
             head_dim: cfg.attention_head_dim,
             inner_dim: dim,
             mlp_hidden_dim,
+            accelerated: cfg.use_accelerated_attn,
+        })
+    }
+
+    fn from_gguf<R: Read + Seek>(
+        cfg: &Config,
+        name: &str,
+        device: &Device,
+        dtype: DType,
+        g: &mut Gguf<R>,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm: layer_norm(cfg.inner_dim(), cfg.eps, device, dtype)?,
+            to_qkv_mlp_proj: g.proj(&format!("{name}.linear1"))?,
+            norm_q: g.qk_norm(&format!("{name}.norm.query_norm"), cfg.eps)?,
+            norm_k: g.qk_norm(&format!("{name}.norm.key_norm"), cfg.eps)?,
+            to_out: g.proj(&format!("{name}.linear2"))?,
+            heads: cfg.num_attention_heads,
+            head_dim: cfg.attention_head_dim,
+            inner_dim: cfg.inner_dim(),
+            mlp_hidden_dim: cfg.mlp_hidden_dim(),
             accelerated: cfg.use_accelerated_attn,
         })
     }
@@ -511,7 +619,7 @@ impl SingleStreamBlock {
 #[derive(Debug, Clone)]
 struct NormOut {
     norm: LayerNorm,
-    linear: Linear,
+    linear: Proj,
 }
 
 impl NormOut {
@@ -519,6 +627,19 @@ impl NormOut {
         Ok(Self {
             norm: layer_norm(dim, eps, vb.device(), vb.dtype())?,
             linear: linear(dim, dim * 2, vb.pp("linear"))?,
+        })
+    }
+
+    fn from_gguf<R: Read + Seek>(
+        dim: usize,
+        eps: f64,
+        device: &Device,
+        dtype: DType,
+        g: &mut Gguf<R>,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm: layer_norm(dim, eps, device, dtype)?,
+            linear: g.norm_out("final_layer.adaLN_modulation.1")?,
         })
     }
 
@@ -532,19 +653,19 @@ impl NormOut {
 
 #[derive(Debug, Clone)]
 pub struct Flux2Transformer2DModel {
-    timestep_linear_1: Linear,
-    timestep_linear_2: Linear,
-    guidance_linear_1: Option<Linear>,
-    guidance_linear_2: Option<Linear>,
+    timestep_linear_1: Proj,
+    timestep_linear_2: Proj,
+    guidance_linear_1: Option<Proj>,
+    guidance_linear_2: Option<Proj>,
     double_stream_modulation_img: Modulation,
     double_stream_modulation_txt: Modulation,
     single_stream_modulation: Modulation,
-    x_embedder: Linear,
-    context_embedder: Linear,
+    x_embedder: Proj,
+    context_embedder: Proj,
     double_blocks: Vec<DoubleStreamBlock>,
     single_blocks: Vec<SingleStreamBlock>,
     norm_out: NormOut,
-    proj_out: Linear,
+    proj_out: Proj,
     axes_dims_rope: Vec<usize>,
     rope_theta: f64,
     timestep_channels: usize,
@@ -554,7 +675,7 @@ impl Flux2Transformer2DModel {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let dim = cfg.inner_dim();
         let out_channels = cfg.out_channels.unwrap_or(cfg.in_channels);
-        let embedder = |vb: VarBuilder| -> Result<(Linear, Linear)> {
+        let embedder = |vb: VarBuilder| -> Result<(Proj, Proj)> {
             Ok((
                 linear(cfg.timestep_guidance_channels, dim, vb.pp("linear_1"))?,
                 linear(dim, dim, vb.pp("linear_2"))?,
@@ -606,6 +727,73 @@ impl Flux2Transformer2DModel {
             single_blocks,
             norm_out: NormOut::new(dim, cfg.eps, vb.pp("norm_out"))?,
             proj_out: linear(dim, out_channels, vb.pp("proj_out"))?,
+            axes_dims_rope: cfg.axes_dims_rope.clone(),
+            rope_theta: cfg.rope_theta,
+            timestep_channels: cfg.timestep_guidance_channels,
+        })
+    }
+
+    /// The same model read out of a gguf under BFL naming, with whatever the
+    /// file quantized kept quantized.
+    pub fn from_gguf<R: Read + Seek>(
+        cfg: &Config,
+        device: &Device,
+        dtype: DType,
+        g: &mut Gguf<R>,
+    ) -> Result<Self> {
+        let dim = cfg.inner_dim();
+        let (guidance_linear_1, guidance_linear_2) = if cfg.guidance_embeds {
+            (
+                Some(g.proj("guidance_in.in_layer")?),
+                Some(g.proj("guidance_in.out_layer")?),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut double_blocks = Vec::with_capacity(cfg.num_layers);
+        for idx in 0..cfg.num_layers {
+            double_blocks.push(DoubleStreamBlock::from_gguf(
+                cfg,
+                &format!("double_blocks.{idx}"),
+                device,
+                dtype,
+                g,
+            )?);
+        }
+        let mut single_blocks = Vec::with_capacity(cfg.num_single_layers);
+        for idx in 0..cfg.num_single_layers {
+            single_blocks.push(SingleStreamBlock::from_gguf(
+                cfg,
+                &format!("single_blocks.{idx}"),
+                device,
+                dtype,
+                g,
+            )?);
+        }
+
+        Ok(Self {
+            timestep_linear_1: g.proj("time_in.in_layer")?,
+            timestep_linear_2: g.proj("time_in.out_layer")?,
+            guidance_linear_1,
+            guidance_linear_2,
+            double_stream_modulation_img: Modulation::from_gguf(
+                2,
+                "double_stream_modulation_img.lin",
+                g,
+            )?,
+            double_stream_modulation_txt: Modulation::from_gguf(
+                2,
+                "double_stream_modulation_txt.lin",
+                g,
+            )?,
+            single_stream_modulation: Modulation::from_gguf(1, "single_stream_modulation.lin", g)?,
+            x_embedder: g.proj("img_in")?,
+            context_embedder: g.proj("txt_in")?,
+            double_blocks,
+            single_blocks,
+            norm_out: NormOut::from_gguf(dim, cfg.eps, device, dtype, g)?,
+            proj_out: g.proj("final_layer.linear")?,
             axes_dims_rope: cfg.axes_dims_rope.clone(),
             rope_theta: cfg.rope_theta,
             timestep_channels: cfg.timestep_guidance_channels,

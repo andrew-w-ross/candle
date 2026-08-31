@@ -12,6 +12,7 @@
 //! projection.
 
 pub mod bfl;
+pub mod gguf;
 pub mod transformer;
 pub mod vae;
 
@@ -321,6 +322,68 @@ mod tests {
         let bad = finite.iter().filter(|v| !v.is_finite()).count();
         let mean = finite.iter().map(|v| v.abs()).sum::<f32>() / finite.len() as f32;
         println!("fp8 9B forward: {} values, {bad} non-finite, mean abs {mean}", finite.len());
+        assert_eq!(bad, 0);
+        assert!(mean > 1e-3 && mean < 1e3, "output collapsed or exploded: {mean}");
+    }
+
+    /// A forward pass of a klein gguf, with the config read off the weights.
+    /// The dense path is verified against diffusers to 1e-6; this asks whether
+    /// the quantized loader reaches the same forward with the same meaning.
+    #[test]
+    #[ignore = "needs a klein gguf and a cuda device; set FLUX2_GGUF"]
+    fn gguf_klein_runs() {
+        let Ok(path) = std::env::var("FLUX2_GGUF") else {
+            return;
+        };
+        assert!(gguf::is_flux2_gguf(&path), "not recognised as flux.2");
+        let Ok(device) = Device::new_cuda(0) else {
+            println!("no cuda device; skipped");
+            return;
+        };
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = candle::quantized::gguf_file::Content::read(&mut file).unwrap();
+        let mut g = gguf::Gguf::new(content, file, device.clone(), DType::BF16);
+        let cfg = g.config().unwrap();
+        println!(
+            "gguf config: {} double, {} single, {} heads, joint {}, mlp_ratio {}, guidance {}",
+            cfg.num_layers,
+            cfg.num_single_layers,
+            cfg.num_attention_heads,
+            cfg.joint_attention_dim,
+            cfg.mlp_ratio,
+            cfg.guidance_embeds,
+        );
+        let model = Flux2Transformer2DModel::from_gguf(&cfg, &device, DType::BF16, &mut g).unwrap();
+
+        let (rows, cols, txt_len) = (8, 8, 16);
+        let noise = |shape: (usize, usize, usize)| {
+            Tensor::randn(0f32, 1f32, shape, &device)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let out = model
+            .forward(
+                &noise((1, rows * cols, cfg.in_channels)),
+                &latent_ids(rows, cols, &device).unwrap(),
+                &noise((1, txt_len, cfg.joint_attention_dim)),
+                &text_ids(txt_len, &device).unwrap(),
+                &Tensor::from_vec(vec![0.7f32], 1, &device).unwrap(),
+                None,
+            )
+            .unwrap();
+
+        let values = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bad = values.iter().filter(|v| !v.is_finite()).count();
+        let mean = values.iter().map(|v| v.abs()).sum::<f32>() / values.len() as f32;
+        println!("gguf forward: {} values, {bad} non-finite, mean abs {mean}", values.len());
         assert_eq!(bad, 0);
         assert!(mean > 1e-3 && mean < 1e3, "output collapsed or exploded: {mean}");
     }
